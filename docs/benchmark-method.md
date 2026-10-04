@@ -25,7 +25,8 @@ Two workloads, chosen with `--handler`:
 `book` is a `BookManager` with no listener attached. Detecting a
 best-bid-and-offer change (reading the best level of each side and comparing)
 is inside the measurement; delivering it to a consumer is not, because there is
-no consumer yet. That changes in phase 6 and this file must change with it.
+no consumer on this thread. `pipeline_bench` (section 12) is where a consumer
+is attached, on another thread.
 
 Which containers the book uses is chosen with `--impl`
 (`book_replay --list` prints the names):
@@ -205,7 +206,8 @@ then says so and reports timings only. It does not guess.
    end, so later runs allocate from warm free lists. This affects the reference
    build (one allocation per order and per level) more than a pooled one. It is
    one reason the first run is discarded.
-3. **Single thread.** One core, no contention. Phase 6 measures the pipeline.
+3. **Single thread.** One core, no contention. Section 12 covers the threaded
+   benchmarks.
 4. **One file is one day.** A quiet day and a volatile day have different
    message mixes and book depths. State which file was used.
 5. **Synthetic data is not evidence.** `itch_synth` and `flow_gen` output is
@@ -279,7 +281,65 @@ build/release/bench/engine_bench --engine pooled --cpu 2 --label pooled
    a claim about what an exchange does, and they do not belong in the results
    table next to numbers measured on Nasdaq data without that label.
 
-## 12. Micro benchmarks
+## 12. The queue and pipeline benchmarks
+
+Two programs measure the threaded code. Both involve more than one thread, and
+that changes what has to be controlled and reported.
+
+```sh
+build/release/bench/queue_bench --queue mutex --cpus 2,4
+build/release/bench/queue_bench --queue mutex-spin --cpus 2,4
+build/release/bench/queue_bench --queue ring --cpus 2,4
+
+build/release/bench/pipeline_bench data/<file> --queue mutex --cpus 2,4,6
+build/release/bench/pipeline_bench data/<file> --queue ring --cpus 2,4,6
+```
+
+1. **Where the threads run decides the result.** Two threads on the two
+   hyper-threads of one core share its execution resources and its nearest
+   cache. Two threads on different cores of one socket share only the last
+   cache level. Unpinned threads are moved by the scheduler in the middle of a
+   run. These give three different answers for the same queue. Pin every
+   thread (`--cpus`), say which CPUs they were, and say whether any two of them
+   are siblings (`lscpu -e` shows the core each logical CPU belongs to).
+2. **A machine with fewer free cores than threads cannot run this benchmark.**
+   A spinning thread that shares a core with the thread it is waiting for
+   spends its time slice preventing the thing it waits for. Both programs warn
+   when the machine has too few CPUs. Numbers from such a machine describe the
+   scheduler, not the queue.
+3. **`queue_bench` times a whole transfer:** from the moment both threads are
+   released to the moment the consumer has taken the last item. `ns/item` is
+   elapsed time divided by items, during which two cores were busy. It is a
+   throughput figure, not the latency of one item, and not a cost in core time.
+4. **Three queues, two comparisons.** `mutex` against `mutex-spin` is what
+   sleeping costs. `mutex-spin` against `ring` is what the lock costs. Quote
+   them as two findings.
+5. **Correctness is part of the report.** The consumer checks that every item
+   arrives once, in order and intact; a run that fails says its timings are
+   void and exits with status 3. `scripts/queue_stress.sh` is the same run
+   with one billion items.
+6. **`pipeline_bench` measures both sides of its comparison itself,** in one
+   process: the single-threaded replay (parse, book and hash on one core) and
+   the three-thread pipeline doing the same work. The pipeline's hash must
+   equal the single thread's or its timings are void. The single-threaded runs
+   are pinned to the first CPU of `--cpus`.
+7. **The pipeline's time includes starting and joining its threads,** which is
+   tens of microseconds. On a file of any real size that is noise; on a file of
+   a few thousand messages it is not, and the number is then meaningless.
+8. **The wait counts explain the ratio.** For each queue the report gives how
+   often the producer found it full and how often the consumer found it empty.
+   A stage that is always waiting for input is faster than the stage before
+   it. The slowest stage is the one whose input queue is full and whose output
+   queue is empty, and it sets the pipeline's throughput.
+9. **The pipeline may be slower than one thread, and that is a result.** Record
+   the ratio with the queue, the capacity, the CPUs and whether the wait counts
+   show one stage starving the others.
+10. **Run it on real data.** On generated files the message mix differs from a
+    real day (section 9, item 5), and so does the share of messages that change
+    a best bid or offer, which is what decides how much crosses the second
+    queue.
+
+## 13. Micro benchmarks
 
 `build/release/bench/micro_bench` (Google Benchmark) times single operations:
 a big-endian load, one decode, a parse of a synthetic stream, a histogram

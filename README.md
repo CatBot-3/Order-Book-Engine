@@ -21,7 +21,7 @@ did not help.
 | 3 | Measurement harness | done; no baseline recorded yet |
 | 4 | Optimization log | harness, tests and tooling ready; the optimized containers are being written; no experiment logged yet |
 | 5 | Matching engine and flow generator | reference engine, flow generator, round trip and tests done; the pooled engine is being written |
-| 6 | Lock-free queue and threaded pipeline | not started |
+| 6 | Lock-free queue and threaded pipeline | mutex queue, seqlock, three-thread pipeline, benchmarks and tests done; the lock-free ring is being written; nothing measured yet |
 | 7 | TCP gateway and market-data publisher | not started |
 
 No performance number appears in this README until it has been measured on
@@ -39,9 +39,12 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
  requests ──> [engine]  price-time matching ──> execution reports to the order's owner
                                   └──> market data as ITCH messages ──> back into [feed]
 
+ as three threads:  parser ──queue──> book ──queue──> consumer      [pipeline]
+                                     └──> top-of-book board (a seqlock per stock) ──> readers
+
  [bench]  latency histogram, hardware counters, report      [gen]  seeded synthetic order flow
 
- planned: [util] SPSC ring   [net] epoll gateway, UDP publisher
+ planned: [net] epoll gateway, UDP publisher
 ```
 
 | Directory | Contents |
@@ -49,10 +52,11 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 | `include/obe/feed/` | message structs, codec, `ItchParser<Handler>`, framing |
 | `include/obe/book/` | `BookManager`, `Book`, the reference and optimized containers, concepts, the named implementations, hash listener |
 | `include/obe/engine/` | the matching-engine contract, `ReferenceEngine`, the hand-written `MatchingEngine`, `ItchFeedWriter`, the round-trip comparison |
-| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer |
+| `include/obe/pipeline/` | the replay as three threads joined by queues; the top-of-book board |
+| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock` |
 | `include/obe/gen/` | seeded generators: order flow for the engine, and a raw ITCH stream for fixtures |
 | `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth` |
-| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `micro_bench` (Google Benchmark) |
+| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `micro_bench` (Google Benchmark) |
 | `tests/`, `fuzz/` | unit, scenario, golden, differential, property and round-trip tests; libFuzzer target |
 | `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, PGO build |
 | `docs/` | [`design.md`](docs/design.md), [`benchmark-method.md`](docs/benchmark-method.md), [`optimization-log.md`](docs/optimization-log.md) |
@@ -165,6 +169,27 @@ F=data/01302019.NASDAQ_ITCH50
    $B/bench/engine_bench --engine pooled --cpu 2
    ```
 
+7. **The lock-free queue is clean.** Two halves, and both are needed. A stress
+   run moves one billion numbered items between two threads and checks every
+   one. ThreadSanitizer checks the memory ordering, which the stress run
+   cannot: x86 orders memory operations more strictly than C++ requires, so a
+   ring with the wrong ordering still passes a stress run on it.
+
+   ```sh
+   scripts/queue_stress.sh $B/bench/queue_bench ring
+   cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan
+   ```
+
+8. **Does the threaded pipeline beat one thread?** The same file, replayed on
+   one thread and as three threads joined by queues, in one run. The two must
+   publish the same stream. Whichever is faster, the answer goes in the log.
+
+   ```sh
+   $B/bench/queue_bench --queue mutex --cpus 2,4
+   $B/bench/queue_bench --queue ring --cpus 2,4
+   $B/bench/pipeline_bench $F --queue ring --cpus 2,4,6
+   ```
+
 ## Matching rules
 
 These are design choices, stated here so nobody has to infer them from the
@@ -210,8 +235,9 @@ Every experiment, accepted or rejected, is in
 | Differential | the book against a naive oracle, update for update; each optimized book and the hand-written engine against their reference |
 | Property | long seeded random sequences against a `std::map` model; for the engine: never crossed, shares conserved, price-time order, determinism |
 | Round trip | the engine's published feed, through the feed handler, rebuilds the engine's book |
+| Concurrency | each queue: every item once, in order, intact, between two threads; the pipeline against the single-threaded replay; the seqlock against torn reads |
 | Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input |
-| Sanitizers | AddressSanitizer and UBSan on all tests; ThreadSanitizer for the concurrent code to come |
+| Sanitizers | AddressSanitizer and UBSan on all tests; ThreadSanitizer on all of them too, which is what checks the queues' memory ordering |
 | CI | all of the above on GCC and Clang, plus a formatting check |
 
 ## Limitations

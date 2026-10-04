@@ -258,6 +258,9 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Engine property | `tests/engine/engine_property_test.cpp` | never crossed, shares conserved, price-time order, determinism, and agreement with an oracle, over seeded random flow |
 | Round trip | `tests/engine/round_trip_test.cpp`, `scripts/flow_round_trip.sh` | the engine's feed, through the feed handler, rebuilds the engine's book |
 | Engine differential | `tests/engine/engine_differential_test.cpp`, `scripts/diff_engines.sh` | the hand-written engine says exactly what the reference says |
+| Queue contract | `tests/util/queue_test.cpp`, `channel_test.cpp` | order, full and empty on one thread; every item once, in order and intact across two; close and cancel |
+| Pipeline | `tests/pipeline/pipeline_test.cpp` | three threads publish exactly what one thread publishes, on any queue, with any capacity, on bad input, and when a stage throws |
+| Seqlock | `tests/util/seqlock_test.cpp` | a reader never sees a value nobody stored |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
 orders that recomputes the best bid and offer by scanning every order after
@@ -268,7 +271,8 @@ matching engine: every resting order of every instrument in one vector, and a
 scan of all of it to find who trades next.
 
 All of this runs under AddressSanitizer and UndefinedBehaviorSanitizer in the
-`debug` preset.
+`debug` preset, and the `tsan` preset runs it under ThreadSanitizer, which is
+the check that matters for the queues and the seqlock (section 9.6).
 
 ## 6. Written by hand
 
@@ -285,12 +289,14 @@ bodies are left out until they are written.
 | Pool (experiment 4, and the engine later) | `include/obe/util/pool.hpp` | **to write** |
 | Reference matching engine | `include/obe/engine/reference_engine.hpp` | written |
 | Matching engine (pooled, intrusive queues) | `include/obe/engine/matching_engine.hpp` | **to write** |
-| Lock-free queue | phase 6 | not started |
+| Mutex queue, spin channel, seqlock, pipeline | `include/obe/util/mutex_queue.hpp`, `spin_channel.hpp`, `seqlock.hpp`, `include/obe/pipeline/` | written |
+| Lock-free ring | `include/obe/util/spsc_ring.hpp` | **to write** |
 
 Each "to write" header holds the interface, the questions to settle and where
 the measurements that settle them come from. Their tests are built into
 second executables (`obe_hand_written_tests` for the containers,
-`obe_hand_written_engine_tests` for the engine) from the same sources as the
+`obe_hand_written_engine_tests` for the engine,
+`obe_hand_written_concurrency_tests` for the ring) from the same sources as the
 reference tests, and carry the `ctest` label `needs-your-code`:
 
 ```sh
@@ -349,6 +355,10 @@ what the baseline measures and what phase 4 replaces one at a time.
 *(yours)*
 
 ### 6.6 Matching engine
+
+*(yours)*
+
+### 6.7 Lock-free ring
 
 *(yours)*
 
@@ -534,7 +544,144 @@ than on a real day (`itch_stats` shows the mix of any file). Numbers measured
 on it compare one build of this code with another. They say nothing about
 Nasdaq.
 
-## 9. Decisions that are open to change
+## 9. Threads and queues (`include/obe/util`, `include/obe/pipeline`)
+
+### 9.1 Two contracts
+
+`queue_concepts.hpp` separates two things that are usually tangled together.
+
+A **`BoundedQueue`** has `try_push` and `try_pop` and never waits. This is all a
+lock-free ring is, and keeping the contract that small keeps the hand-written
+structure small enough to reason about completely.
+
+A **`Channel`** can be waited on: `push` waits for room, `pop` waits for an
+item, the producer can `close` it to say "no more", and anybody can `cancel` it
+to say "stop now". A pipeline stage needs all four. How a channel waits is its
+own business.
+
+`SpinChannel<Queue>` builds the second out of the first by retrying. So the
+waiting policy, the end-of-stream flag and the cancellation flag are written
+once, tested once, and shared by every queue.
+
+One detail in it is easy to get wrong. A consumer that finds the queue empty
+and then sees "closed" cannot conclude the stream is over: the producer may
+have pushed its last item and closed between the two observations. `pop` reads
+the closed flag first and looks at the queue second, so that an empty queue
+seen after "closed" really is final. `TheLastItemBeforeACloseIsNeverLost`
+tests exactly this, two thousand times over.
+
+### 9.2 Three channels, each one change from the next
+
+| `--queue` | Lock | A thread that has to wait |
+|---|---|---|
+| `mutex` | `std::mutex` | sleeps on a condition variable |
+| `mutex-spin` | `std::mutex` | spins |
+| `ring` | none (`SpscRing`, **written by hand**) | spins |
+
+The spec asks for the ring to be compared with a mutex queue. Comparing only
+those two would mix two differences: the lock, and the sleep. The middle row
+separates them. `mutex` against `mutex-spin` is what sleeping costs;
+`mutex-spin` against `ring` is what the lock costs.
+
+Spinning is not free either. A spinning thread keeps a core at full power while
+it has nothing to do, and on a machine with fewer free cores than threads it
+takes time from the very thread it is waiting for. `util::Backoff` spins a
+bounded number of times with the CPU's pause hint and then starts yielding,
+which keeps oversubscribed machines (CI, ThreadSanitizer runs) making progress.
+
+### 9.3 The pipeline
+
+```
+ parser thread ──(BookEvent)──> book thread ──(BboUpdate)──> consumer thread
+ framing, decode                order store, levels           hash, statistics
+                                       │
+                                       └──> TopOfBookBoard (a Seqlock per locate) ──> any reader
+```
+
+`run_pipeline<Channel, Impl>(bytes)` is the single-threaded replay cut at two
+points. Each stage owns its data outright; the only things two threads both
+touch are the queues and the board. The book logic is the phase 2
+`BookManager`, unchanged.
+
+What crosses the first queue is a `BookEvent`: the decoded message flattened
+into 40 bytes of plain integers. Decoding on the parser thread is a choice. The
+alternative is to pass a pointer to the undecoded bytes and decode on the book
+thread, which would leave the first thread with almost nothing to do. Messages
+that cannot change a book are dropped before the queue.
+
+The result does not depend on how the threads interleave: each queue keeps
+order, each stage has one input, and no stage reads a clock. So the consumer's
+hash must equal the single-threaded replay's, and that equality is the
+pipeline's correctness test. `pipeline_bench` checks it on every run and voids
+its timings if it fails.
+
+A stage that throws cancels both queues, which releases its neighbours from
+whatever wait they were in; every thread is joined, and the exception is
+rethrown on the caller's thread. Without that, one failing stage would leave
+the other two waiting for ever.
+
+### 9.4 Seqlock and the board
+
+The queue to the consumer carries every update, in order, to one reader. The
+board answers a different question for any number of readers: what is the top
+of book of this security now? `Seqlock<T>` lets the book thread publish it
+without ever waiting for a reader: the writer bumps a sequence number to odd,
+writes, and bumps it to even; a reader copies the value and retries if the
+sequence was odd or changed while it copied.
+
+The value is stored as 64-bit atomic words, not as a plain `T`. In the textbook
+seqlock a reader copies a plain value while the writer may be changing it and
+discards the copy if it was torn. In C++ that copy is a data race, which is
+undefined behaviour whether or not the result is used, and ThreadSanitizer
+reports it. With atomic words every access is defined, and on x86 the machine
+code is the same plain moves.
+
+The writer is wait-free. A reader is only lock-free: it can be made to retry
+for as long as writes keep arriving. `try_load` exists for a reader that would
+sooner skip a sample than wait.
+
+### 9.5 What is measured
+
+`queue_bench` moves numbered items from one thread to another and times the
+whole transfer. The consumer checks every item, so the same program is the
+ordered stress run of criterion 6 (`scripts/queue_stress.sh` runs it with one
+billion items).
+
+`pipeline_bench` replays one file both ways in one process, single-threaded
+and as the pipeline, checks that the two produced the same hash, and prints
+the ratio. It also prints how often each stage had to wait on each queue,
+which is what explains the ratio: the slowest stage is the one whose input
+queue is full and whose output queue is empty.
+
+The pipeline may lose, and the spec says so. A message costs tens of
+nanoseconds to process; moving it to another core costs a cache-line transfer
+each way. Either outcome goes in the log with the numbers and the CPUs the
+threads were pinned to.
+
+### 9.6 How it is tested
+
+1. **The contract, on one thread:** order, full, empty, wrap-around, a model
+   comparison on random operations, and what happens to a value whose push was
+   refused (nothing: the caller retries with it).
+2. **Two threads:** every item arrives once, in order and intact, with the
+   queue kept mostly full, mostly empty, and with one slot. The items carry
+   fields derived from each other, so a slot read before it was completely
+   written is detected.
+3. **ThreadSanitizer.** This is the test of the memory ordering, and a stress
+   run is not. x86 orders stores and loads more strictly than C++ requires, so
+   a ring with every ordering relaxed passes a billion-item run on it without
+   error. ThreadSanitizer checks the ordering the code asked for.
+4. **The pipeline against the single thread:** same hash for every security,
+   same counters, same final book, on streams of both generators, with queues
+   of one slot, on truncated and corrupt input, and with a stage that throws.
+5. **The seqlock:** readers on other threads check on every load that the value
+   is one some store published whole, and that they never go back in time.
+
+The tests are written to fail cleanly when the ring is not there yet or is
+wrong: a thread's exception is carried back to the test, and every waiting
+loop has a way out.
+
+## 10. Decisions that are open to change
 
 These were made to get phases 1 to 3 standing. Each is cheap to revisit.
 
@@ -566,8 +713,21 @@ These were made to get phases 1 to 3 standing. Each is cheap to revisit.
    must not call back into it. Holding them by value, as `BookManager` holds
    its listener, would make the generator's feedback loop awkward: the flow
    generator is both the source of requests and a report sink.
+8. **The parser thread decodes.** What crosses the first queue is a decoded
+   `BookEvent`, not a pointer to the raw message. Passing pointers would make
+   the first stage nearly idle; whether that would be faster overall is a
+   measurement `pipeline_bench` can make if a second encoding is added.
+9. **One item per queue operation.** A stage pushes and pops single items.
+   Moving several per operation would cut the number of times the two sides
+   touch each other's cache lines, at the cost of holding items back. It is
+   the first thing to try if the pipeline loses to the single thread.
+10. **Spinning backs off to yielding.** `util::Backoff` spins 256 times and
+    then yields the time slice. On a machine with a core per thread the yield
+    is never reached; on one without, it is what keeps the run from stalling.
+    A latency-critical deployment would spin without limit and reserve the
+    cores.
 
-## 10. Known limits
+## 11. Known limits
 
 1. Linux only: `mmap`, and later `epoll` and `perf`.
 2. GCC and Clang only: `__builtin_bswap*` and, in the benchmark, `rdtsc`.

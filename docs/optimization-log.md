@@ -147,6 +147,8 @@ that is yours.
 | 9 | Symbol filter: process only a watch list | `replay_bench --symbols A,B,C` | Choose watch lists of different sizes and plot cost against the share of messages applied | |
 | 10 | Link-time and profile-guided optimization | `release-lto` preset; `scripts/pgo_build.sh` | Run them. Expect little from LTO: every app is a single translation unit. Say what the training data for PGO was | |
 | 11 | Matching engine: node-based reference to pooled orders in intrusive queues | `engine_bench --engine reference` and `--engine pooled` on the same recorded tape; the differential test and `scripts/diff_engines.sh` | `include/obe/engine/matching_engine.hpp`. Count the allocations each engine makes per resting order and say which of them the pool removed | |
+| 12 | Queue: mutex and condition variable, to the same lock with spinning, to a lock-free ring | `queue_bench --queue mutex`, `mutex-spin`, `ring`; contract tests; `scripts/queue_stress.sh` | `include/obe/util/spsc_ring.hpp`. Log the two steps separately (what sleeping costs, what the lock costs), then the ring with and without the cached indices. State the CPUs the two threads were pinned to | |
+| 13 | Three-thread pipeline against the single-threaded replay | `pipeline_bench <file> --queue NAME --cpus P,B,C`, which measures both and checks they agree | Run it on the real file. Record the ratio either way, with the wait counts that explain it | |
 
 `--impl flat-vector` combines experiments 1 and 3 for the cumulative row in the
 README's results table.
