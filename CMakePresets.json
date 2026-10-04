@@ -1,6 +1,10 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -42,6 +46,27 @@
       }
     },
     {
+      "name": "release-lto",
+      "displayName": "Release + link-time optimization",
+      "description": "Phase 4, experiment 10. Compare with 'release' on the same file.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "OBE_LTO": "ON"
+      }
+    },
+    {
+      "name": "release-pgo",
+      "displayName": "Release + profile-guided optimization",
+      "description": "Phase 4, experiment 10. Do not configure this by hand: scripts/pgo_build.sh runs its two stages.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "OBE_PGO": "generate",
+        "OBE_BUILD_TESTS": "OFF"
+      }
+    },
+    {
       "name": "fuzz",
       "displayName": "libFuzzer + ASan + UBSan (Clang only)",
       "inherits": "base",
@@ -57,26 +82,52 @@
     }
   ],
   "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "tsan", "configurePreset": "tsan" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "fuzz", "configurePreset": "fuzz" }
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "release-lto",
+      "configurePreset": "release-lto"
+    },
+    {
+      "name": "release-pgo",
+      "configurePreset": "release-pgo"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    }
   ],
   "testPresets": [
     {
       "name": "debug",
       "configurePreset": "debug",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "tsan",
       "configurePreset": "tsan",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "release",
       "configurePreset": "release",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

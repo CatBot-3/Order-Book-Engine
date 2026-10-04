@@ -134,6 +134,21 @@ class BookManager : public feed::HandlerBase {
         publish(book, m.hdr);
     }
 
+    // --- Hints ---------------------------------------------------------------
+
+    // Tells the order store that `id` is about to be looked up, so it can
+    // start pulling the relevant memory into cache. A no-op for stores that do
+    // not offer prefetch(). The replay loop calls this one message ahead: the
+    // next message is already in the buffer, so its lookup can begin while the
+    // current message is still being handled (phase 4, experiment 6).
+    void prefetch(OrderId id) const noexcept {
+        if constexpr (requires(const Store& s) { s.prefetch(id); }) {
+            store_.prefetch(id);
+        } else {
+            static_cast<void>(id);
+        }
+    }
+
     // --- Queries -------------------------------------------------------------
 
     [[nodiscard]] const BookType& book(Locate locate) const noexcept { return books_[locate]; }

@@ -1,81 +1,98 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
+#include <memory>
+#include <unordered_map>
+#include <utility>
 
 #include "obe/book/concepts.hpp"
 #include "obe/book/types.hpp"
 #include "obe/types.hpp"
-#include "obe/util/todo.hpp"
 
-// ============================================================================
-//  YOURS TO WRITE (spec section 10: the order store is written by hand)
-// ============================================================================
+// The reference order store: a map from order reference number to OrderRecord,
+// built on std::unordered_map.
 //
-// OrderStore is the reference order store of phase 2: a map from order
-// reference number to OrderRecord. The spec fixes the container for the
-// reference version, std::unordered_map, because the reference exists to be
-// obviously correct and to be the baseline every later number is compared with.
+// It exists to be obviously correct and to be the baseline every later number
+// is compared with. Its contract is OrderStoreLike in obe/book/concepts.hpp and
+// its judge is tests/book/order_store_test.cpp.
 //
-// The interface and its contract are in obe/book/concepts.hpp (OrderStoreLike).
-// The judge is tests/book/order_store_test.cpp. Every function below currently
-// throws; replace each util::todo(...) with the real body and add whatever
-// private members you need.
+// Why this is the hot data structure. An Order Executed message carries a
+// reference number and a share count, nothing else. The price and side needed
+// to update the right level have to be looked up here. The same is true of
+// cancels, deletes and replaces, so nearly every message in the feed costs one
+// find() in this map.
 //
-// Things to settle before writing it. Each is also a question an interviewer
-// can ask about this file, so it is worth having an answer in your own words.
+// Why std::unordered_map is slow at that job, which is what phase 4 measures:
+//   - Every order is a separately allocated node. An add calls the allocator
+//     and a delete calls it again.
+//   - A lookup follows at least two pointers to memory that is rarely in
+//     cache: the bucket array, then the node. With hundreds of thousands of
+//     live orders the nodes are scattered across the heap in allocation order,
+//     which has nothing to do with lookup order.
+//   - Growing rehashes every element at once, which shows up as a single very
+//     large per-message latency.
 //
-//  1. Why is this the hot data structure at all?
-//     Look at what an Order Executed message carries (feed/messages.hpp) and
-//     what PriceLevels::remove needs. Roughly what fraction of a day's messages
-//     end up calling find()? (itch_stats will tell you.)
+// The decisions in this file:
 //
-//  2. insert() must not overwrite an existing order.
-//     operator[] is the wrong tool: it does two things you do not want here.
-//     Which member function inserts only when the key is absent and reports
-//     which case happened, in a single lookup?
+//   insert uses try_emplace. It inserts only when the key is absent and says
+//   which case happened, in one lookup. operator[] would default-construct a
+//   record for a missing key and silently overwrite an existing one; both are
+//   wrong here, because a duplicate reference number must be reported and the
+//   original kept.
 //
-//  3. How long does the pointer from find() stay valid?
-//     For std::unordered_map, does a rehash move the elements or only the
-//     buckets? The concept still promises only "until the next insert or
-//     erase", which is weaker than what this container gives. Why promise less
-//     than you have? (Think about what an open-addressing table does when it
-//     grows, and which class has to keep working unchanged in phase 4.)
+//   find returns a raw pointer, nullptr for "not there". The contract promises
+//   it only until the next insert or erase. std::unordered_map gives more (a
+//   rehash moves buckets, never nodes), but an open-addressing table that
+//   grows does move its elements, and BookManager must keep working unchanged
+//   when the container is swapped. A contract is set by the weakest
+//   implementation that has to honour it.
 //
-//  4. Should the constructor reserve?
-//     A day has hundreds of millions of adds, but what matters is the peak
-//     number of orders alive at once. Measure it (track the maximum of size()
-//     during a replay) before choosing a number. Then ask what reserve() saves
-//     on a node-based map, and what it cannot save.
+//   The constructor can reserve. A day has hundreds of millions of adds, but
+//   what sizes the table is the peak number of orders alive at once, which
+//   feed_profile reports. For this node-based map, reserve() pre-builds the
+//   bucket array and so avoids every rehash; it cannot avoid the per-order
+//   node allocation.
 //
-//  5. Which of these functions can be noexcept, and which cannot? Why does it
-//     matter less here than it would for a move constructor?
-//
-// Deliberately not here yet: iteration, a custom hash, a pool allocator. Those
-// are phase 4 experiments. Get the baseline measured first, so each of them
-// has a "before" number.
+//   The allocator is a template parameter so that the pool-allocator
+//   experiment (obe/book/pooled.hpp) can reuse this class unchanged.
 
 namespace obe::book {
 
-class OrderStore {
+template <class Allocator = std::allocator<std::pair<const OrderId, OrderRecord>>>
+class BasicOrderStore {
  public:
-    OrderStore() = default;
+    BasicOrderStore() = default;
+
+    // Pre-size for `expected_orders` live orders, so the table never rehashes
+    // until that many are resting at once.
+    explicit BasicOrderStore(std::size_t expected_orders) { map_.reserve(expected_orders); }
 
     // Adds the order. Returns false, changing nothing, if `id` is present.
-    bool insert(OrderId id, const OrderRecord& rec) { util::todo("OrderStore::insert", id, rec); }
+    bool insert(OrderId id, const OrderRecord& rec) { return map_.try_emplace(id, rec).second; }
 
     // The stored record, or nullptr. Valid until the next insert or erase.
-    OrderRecord* find(OrderId id) { util::todo("OrderStore::find", id); }
-    const OrderRecord* find(OrderId id) const { util::todo("OrderStore::find const", id); }
+    [[nodiscard]] OrderRecord* find(OrderId id) noexcept {
+        const auto it = map_.find(id);
+        return it == map_.end() ? nullptr : &it->second;
+    }
+    [[nodiscard]] const OrderRecord* find(OrderId id) const noexcept {
+        const auto it = map_.find(id);
+        return it == map_.end() ? nullptr : &it->second;
+    }
 
     // Removes the order. Returns false if it was not present.
-    bool erase(OrderId id) { util::todo("OrderStore::erase", id); }
+    bool erase(OrderId id) noexcept { return map_.erase(id) != 0; }
 
     // Number of orders currently stored.
-    std::size_t size() const { util::todo("OrderStore::size"); }
+    [[nodiscard]] std::size_t size() const noexcept { return map_.size(); }
 
  private:
-    // Your storage goes here.
+    std::unordered_map<OrderId, OrderRecord, std::hash<OrderId>, std::equal_to<OrderId>, Allocator>
+        map_;
 };
+
+using OrderStore = BasicOrderStore<>;
 
 static_assert(OrderStoreLike<OrderStore>);
 

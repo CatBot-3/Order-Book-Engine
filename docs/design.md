@@ -252,6 +252,7 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Scenario | `tests/book/book_manager_test.cpp` | one rule of section 4.5 of the spec per test |
 | Golden | `tests/book/book_replay_test.cpp` | a hand-built byte stream with a hand-worked book |
 | Differential | same file | `BookManager` against `NaiveBook`, update for update |
+| Differential | `tests/book/differential_test.cpp`, `scripts/diff_books.sh` | each optimized book against the reference book, security by security |
 | Integration | `ctest` entries in `tests/CMakeLists.txt` | the real apps on a generated file, against the independent Python counter |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
@@ -265,37 +266,121 @@ All of this runs under AddressSanitizer and UndefinedBehaviorSanitizer in the
 
 The project spec keeps the core data structures hand-written. Their headers
 ship with the interface, the contract, design questions and a test suite; the
-bodies are left out.
+bodies are left out until they are written.
 
 | Component | File | Status |
 |---|---|---|
-| Reference order store | `include/obe/book/order_store.hpp` | **to write** |
-| Reference price levels | `include/obe/book/price_levels.hpp` | **to write** |
-| Optimized containers | phase 4 | not started |
+| Reference order store | `include/obe/book/order_store.hpp` | written |
+| Reference price levels | `include/obe/book/price_levels.hpp` | written |
+| Flat order table (experiment 1) | `include/obe/book/flat_order_store.hpp` | **to write** |
+| Contiguous price levels (experiment 3) | `include/obe/book/vector_price_levels.hpp` | **to write** |
+| Pool (experiment 4, and the engine later) | `include/obe/util/pool.hpp` | **to write** |
 | Matching loop | phase 5 | not started |
 | Lock-free queue | phase 6 | not started |
 
-Until the first two are written, `obe_book_tests` fails with messages naming
-the missing functions, and `book_replay`, `book_view` and `replay_bench
---handler book` exit with status 4. Everything else passes:
+Each "to write" header holds the interface, the questions to settle and where
+the measurements that settle them come from. Their tests are built into a
+second executable, `obe_hand_written_tests`, from the same sources as the
+reference tests, and carry the `ctest` label `needs-your-code`:
 
 ```sh
-ctest --preset debug -LE needs-your-code     # the finished parts only
-ctest --preset debug                         # everything
+ctest --preset debug -LE needs-your-code     # everything that is finished
+ctest --preset debug -L needs-your-code      # the hand-written parts
 ```
 
-Record your own design decisions for those two files here as you make them.
-The reasoning is the part an interviewer will ask about.
+Until a container is written its tests fail with a message naming the missing
+function, and `--impl <name>` in the apps exits with status 4. Record the
+decisions you make for each one in sections 6.3 onwards.
 
-### 6.1 Order store decisions
+### 6.1 Reference order store
+
+`std::unordered_map<OrderId, OrderRecord>` behind the `OrderStoreLike`
+contract. The reasoning for each choice is in the header; in short:
+
+1. `insert` uses `try_emplace`: one lookup, never overwrites, and reports a
+   duplicate so the book can count it.
+2. `find` returns a pointer promised only until the next insert or erase. The
+   node-based map gives more, but the contract is set by the weakest container
+   that will ever implement it.
+3. An optional constructor argument reserves buckets for the expected peak of
+   live orders. That removes rehashes; it cannot remove the per-order node
+   allocation, which is one of the costs phase 4 goes after.
+
+### 6.2 Reference price levels
+
+`std::map<Price, std::uint64_t>` behind the `PriceLevelsLike` contract, one
+object per side.
+
+1. One class serves both sides and branches on a stored flag to pick the front
+   (best ask) or the back (best bid). A comparator template parameter or a
+   negated key would avoid the branch at the cost of either two types or a
+   conversion on every price that crosses the interface. The reference chooses
+   whatever is most obviously right.
+2. A level that reaches zero is erased, so `best()` can never report a price
+   with no shares.
+3. `remove` refuses and changes nothing when the level is missing or too
+   small, which turns a book inconsistency into a counter instead of a quietly
+   wrong book.
+
+Both are deliberately the "slow, obvious" versions. Their costs (a heap node
+per order and per level, pointer chasing on every lookup, rehash spikes) are
+what the baseline measures and what phase 4 replaces one at a time.
+
+### 6.3 Flat order table
 
 *(yours)*
 
-### 6.2 Price levels decisions
+### 6.4 Contiguous price levels
 
 *(yours)*
 
-## 7. Decisions that are open to change
+### 6.5 Pool
+
+*(yours)*
+
+## 7. Phase 4 structure
+
+Phase 4 swaps containers and measures. The structure that makes each swap safe
+and each measurement comparable:
+
+**Named implementations** (`include/obe/book/implementations.hpp`). A book is a
+store paired with a level container, and each pairing has a name. Every pairing
+differs from the reference in exactly one respect, so one comparison isolates
+one effect; `flat-vector` is the exception and exists for the cumulative
+result. `book_replay`, `replay_bench` and the tests all select by that name,
+so a new pairing is replayable, benchmarkable and tested by adding it to one
+list.
+
+**One test suite, built twice.** `tests/support/implementations.hpp` switches
+the typed-test lists on a compile definition. The reference build is part of
+the passing suite. The hand-written build runs the same contract, scenario and
+golden tests against the optimized containers, plus
+`tests/book/differential_test.cpp`, which replays generated streams of four
+different shapes through an optimized book and the reference and requires
+identical update hashes, counters and final books.
+
+**The comparison is enforced, not remembered.** `replay_bench` replays the
+reference alongside any other implementation before timing it, and marks the
+timings void if the hashes differ. `scripts/diff_books.sh` does the same on a
+full day, security by security.
+
+**Measure the premise first.** `feed_profile` reports the facts the experiments
+assume: the peak of resting orders, how reference numbers are distributed, how
+long sides get, and how far from the best price updates land. It uses the
+reference book, and it checks its own level accounting against the book it
+profiled.
+
+**The pool is shared.** `util::PoolAllocator` is stateless and every instance
+for a node type uses one pool. A pool per container would give each of the
+131072 level maps its own slabs. The cost is that pooled containers of one
+node type are not safe to use from two threads, which the single-writer design
+already rules out.
+
+**Optional hooks are detected, not required.** `BookManager::prefetch` forwards
+to the store's `prefetch` if it has one and compiles to nothing otherwise, so
+the prefetch experiment needs no change to the contract or to the reference.
+
+## 8. Decisions that are open to change
 
 These were made to get phases 1 to 3 standing. Each is cheap to revisit.
 
@@ -318,7 +403,7 @@ These were made to get phases 1 to 3 standing. Each is cheap to revisit.
    orders to execute. It is for fixtures and for smoke-testing the harness, and
    numbers measured on it mean nothing about real data. Phase 5 replaces it.
 
-## 8. Known limits
+## 9. Known limits
 
 1. Linux only: `mmap`, and later `epoll` and `perf`.
 2. GCC and Clang only: `__builtin_bswap*` and, in the benchmark, `rdtsc`.

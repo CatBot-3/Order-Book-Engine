@@ -28,9 +28,16 @@ namespace obe::book {
 //                    only until the next insert or erase on the store.
 //   erase(id)        Removes the order. Returns false if it was not present.
 //   size()           Number of orders currently stored.
+//
+// A store must also be movable: BookManager is handed its store by value, so a
+// pre-sized one can be built outside and moved in.
+//
+// Optional: a store may also offer `void prefetch(OrderId) const noexcept`,
+// which starts loading whatever a later find(id) will touch. BookManager
+// forwards to it when it exists (phase 4, experiment 6).
 template <class S>
 concept OrderStoreLike =
-    std::default_initializable<S> &&
+    std::default_initializable<S> && std::movable<S> &&
     requires(S store, const S const_store, OrderId id, const OrderRecord& rec) {
         { store.insert(id, rec) } -> std::same_as<bool>;
         { store.find(id) } -> std::same_as<OrderRecord*>;

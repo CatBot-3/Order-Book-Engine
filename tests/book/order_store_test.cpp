@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <concepts>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <utility>
 #include <vector>
 
 #include "obe/book/concepts.hpp"
@@ -130,6 +132,108 @@ TYPED_TEST(OrderStoreTest, HoldsManyOrdersThroughGrowthAndShrinkage) {
         }
         ASSERT_EQ(this->store.find(id * 3 + 1), nullptr);
     }
+}
+
+TYPED_TEST(OrderStoreTest, KeysThatDifferOnlyInTheirHighBitsStayDistinct) {
+    // Every one of these keys has the same low 40 bits. A table that picks a
+    // slot from the low bits alone sends them all to one place, so this checks
+    // that collisions are resolved correctly. It does not time anything, but
+    // if it is noticeably slow for your table, the hash function is why.
+    constexpr std::uint64_t kCount = 4'000;
+    const auto key = [](std::uint64_t i) { return i << 40; };
+    for (std::uint64_t i = 0; i < kCount; ++i) {
+        ASSERT_TRUE(this->store.insert(
+            key(i), OrderRecord{.price = static_cast<Price>(i), .qty = 7, .side = Side::Buy}))
+            << i;
+    }
+    ASSERT_EQ(this->store.size(), kCount);
+    for (std::uint64_t i = 0; i < kCount; ++i) {
+        const OrderRecord* found = this->store.find(key(i));
+        ASSERT_NE(found, nullptr) << i;
+        ASSERT_EQ(found->price, static_cast<Price>(i));
+        ASSERT_EQ(this->store.find(key(i) + 1), nullptr) << "a neighbouring key must not match";
+    }
+    for (std::uint64_t i = 0; i < kCount; i += 2) {
+        ASSERT_TRUE(this->store.erase(key(i)));
+    }
+    for (std::uint64_t i = 0; i < kCount; ++i) {
+        ASSERT_EQ(this->store.find(key(i)) != nullptr, i % 2 == 1) << i;
+    }
+    ASSERT_EQ(this->store.size(), kCount / 2);
+}
+
+TYPED_TEST(OrderStoreTest, SurvivesLongChurnAtAConstantSize) {
+    // The shape of a real day: as many erases as inserts, with the number of
+    // live orders roughly level. A window of 2'000 live orders slides over two
+    // million reference numbers. An open-addressing table that marks erased
+    // slots and never cleans them up fills with markers here: lookups of
+    // absent keys get slower and slower, and eventually an insert finds no
+    // free slot. If this test crawls or hangs, that is what happened.
+    constexpr OrderId kLive = 2'000;
+    constexpr OrderId kTotal = 2'000'000;
+    for (OrderId id = 0; id < kTotal; ++id) {
+        ASSERT_TRUE(this->store.insert(
+            id, OrderRecord{.price = static_cast<Price>(id & 0xffff), .qty = 1, .side = Side::Buy}))
+            << id;
+        if (id >= kLive) {
+            ASSERT_TRUE(this->store.erase(id - kLive)) << id;
+        }
+        if ((id & 0xfff) == 0) {
+            const OrderRecord* newest = this->store.find(id);
+            ASSERT_NE(newest, nullptr) << id;
+            ASSERT_EQ(newest->price, static_cast<Price>(id & 0xffff));
+            ASSERT_EQ(this->store.find(id + 1), nullptr) << "not inserted yet";
+            if (id >= kLive) {
+                ASSERT_EQ(this->store.find(id - kLive), nullptr) << "erased";
+                ASSERT_EQ(this->store.size(), kLive);
+            }
+        }
+    }
+    ASSERT_EQ(this->store.size(), kLive);
+    for (OrderId id = kTotal - kLive; id < kTotal; ++id) {
+        ASSERT_NE(this->store.find(id), nullptr) << id;
+    }
+}
+
+TYPED_TEST(OrderStoreTest, APreSizedStoreStillGrowsPastItsReservation) {
+    // Pre-sizing is a hint about the expected peak, not a limit. A day busier
+    // than expected must still replay correctly.
+    if constexpr (std::constructible_from<TypeParam, std::size_t>) {
+        TypeParam small(std::size_t{16});
+        constexpr OrderId kCount = 20'000;
+        for (OrderId id = 0; id < kCount; ++id) {
+            ASSERT_TRUE(small.insert(
+                id * 7 + 1,
+                OrderRecord{.price = static_cast<Price>(id), .qty = 2, .side = Side::Sell}))
+                << id;
+        }
+        ASSERT_EQ(small.size(), kCount);
+        for (OrderId id = 0; id < kCount; ++id) {
+            const OrderRecord* found = small.find(id * 7 + 1);
+            ASSERT_NE(found, nullptr) << id;
+            ASSERT_EQ(found->price, static_cast<Price>(id));
+        }
+    } else {
+        GTEST_SKIP() << "this store has no pre-sizing constructor";
+    }
+}
+
+TYPED_TEST(OrderStoreTest, MovingAStoreMovesItsOrders) {
+    // BookManager is handed its store by value.
+    constexpr OrderId kCount = 1'000;
+    for (OrderId id = 0; id < kCount; ++id) {
+        ASSERT_TRUE(this->store.insert(
+            id + 100, OrderRecord{.price = static_cast<Price>(id), .qty = 3, .side = Side::Buy}));
+    }
+    TypeParam moved(std::move(this->store));
+    ASSERT_EQ(moved.size(), kCount);
+    for (OrderId id = 0; id < kCount; ++id) {
+        const OrderRecord* found = moved.find(id + 100);
+        ASSERT_NE(found, nullptr) << id;
+        ASSERT_EQ(found->price, static_cast<Price>(id));
+    }
+    ASSERT_TRUE(moved.insert(5, kBuy)) << "a moved-to store is fully usable";
+    ASSERT_TRUE(moved.erase(100));
 }
 
 // Model-based test: a long seeded sequence of random operations, checked

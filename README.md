@@ -17,9 +17,9 @@ did not help.
 |---|---|---|
 | 0 | Build, CI, lint, data fetch | done |
 | 1 | ITCH 5.0 parser, `itch_stats`, fuzzing | done; not yet run on a real file |
-| 2 | Reference order book | logic, tests and apps done; the two containers are being written |
+| 2 | Reference order book | done; not yet run on a real file |
 | 3 | Measurement harness | done; no baseline recorded yet |
-| 4 | Optimization log | not started |
+| 4 | Optimization log | harness, tests and tooling ready; the optimized containers are being written; no experiment logged yet |
 | 5 | Matching engine and flow generator | not started |
 | 6 | Lock-free queue and threaded pipeline | not started |
 | 7 | TCP gateway and market-data publisher | not started |
@@ -44,13 +44,13 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 | Directory | Contents |
 |---|---|
 | `include/obe/feed/` | message structs, codec, `ItchParser<Handler>`, framing |
-| `include/obe/book/` | `BookManager`, `Book`, `OrderStore`, `PriceLevels`, concepts, hash listener |
-| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile` |
+| `include/obe/book/` | `BookManager`, `Book`, the reference and optimized containers, concepts, the named implementations, hash listener |
+| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer |
 | `include/obe/gen/` | seeded synthetic ITCH generator for fixtures and CI |
-| `apps/` | `itch_stats`, `book_replay`, `book_view`, `itch_synth` |
+| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `itch_synth` |
 | `bench/` | `replay_bench` (full replay), `micro_bench` (Google Benchmark) |
 | `tests/`, `fuzz/` | unit, scenario, golden, differential and property tests; libFuzzer target |
-| `scripts/` | data fetch, independent message counter, benchmark runner |
+| `scripts/` | data fetch, independent message counter, benchmark runner, book comparison, before/after tables, PGO build |
 | `docs/` | [`design.md`](docs/design.md), [`benchmark-method.md`](docs/benchmark-method.md), [`optimization-log.md`](docs/optimization-log.md) |
 
 The library is header-only. Why each piece is shaped the way it is: see
@@ -63,14 +63,15 @@ C++20 compiler. Developed and tested with GCC 13 and Clang 18. GoogleTest and
 Google Benchmark are fetched by CMake.
 
 ```sh
-cmake --preset debug                 # Debug with AddressSanitizer and UBSan
+cmake --preset debug                         # Debug with AddressSanitizer and UBSan
 cmake --build --preset debug
-ctest --preset debug                 # everything
-ctest --preset debug -LE needs-your-code    # only the finished parts
+ctest --preset debug -LE needs-your-code     # everything that is finished
+ctest --preset debug -L needs-your-code      # the optimized containers still being written
 ```
 
 Other presets: `release` (the only one whose timings mean anything), `tsan`,
-and `fuzz` (Clang, libFuzzer).
+`fuzz` (Clang, libFuzzer), and `release-lto` and `release-pgo` for the build
+experiments.
 
 ```sh
 cmake --preset fuzz && cmake --build --preset fuzz
@@ -120,11 +121,23 @@ F=data/01302019.NASDAQ_ITCH50
    $B/apps/book_view $F AAPL --at 10:00:00 --depth 10
    ```
 
-3. **The numbers.** Five runs, median and range, thread pinned, file in
-   memory, with the hardware, compiler and flags printed alongside.
+3. **An optimized book equals the reference book.** Both replay the whole day
+   and must publish the same best-bid-and-offer stream for every security.
 
    ```sh
+   scripts/diff_books.sh --replay $B/apps/book_replay --file $F
+   ```
+
+4. **The numbers.** Five runs, median and range, thread pinned, file in
+   memory, with the hardware, compiler and flags printed alongside. For any
+   implementation other than the reference, the benchmark repeats check 3
+   itself and voids its timings if the books differ.
+
+   ```sh
+   $B/apps/feed_profile $F                      # the facts the experiments rest on
    scripts/run_bench.sh $F baseline
+   scripts/run_bench.sh $F flat-store --impl flat-store
+   scripts/compare_runs.py results/<before>/result.json results/<after>/result.json
    ```
 
 ## Results

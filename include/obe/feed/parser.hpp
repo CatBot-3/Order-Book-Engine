@@ -139,6 +139,32 @@ struct Frame {
     return load_be<Locate>(f.data + 1);
 }
 
+// The order reference number a message will make the order store touch, if it
+// is one of the seven order messages: A and F (the new order), E, C, X and D
+// (the order they act on) and U (the original order). Returns false for every
+// other type and for a frame too short to hold one.
+//
+// In all seven the reference number is the eight bytes at offset 11. That is a
+// property of the wire format, pinned by the decoder tests.
+[[nodiscard]] inline bool peek_order_ref(const Frame& f, OrderId& out) noexcept {
+    if (f.size < 19) [[unlikely]] {
+        return false;
+    }
+    switch (f.type()) {
+        case 'A':
+        case 'F':
+        case 'E':
+        case 'C':
+        case 'X':
+        case 'D':
+        case 'U':
+            out = load_be<OrderId>(f.data + 11);
+            return true;
+        default:
+            return false;
+    }
+}
+
 inline constexpr std::size_t kLengthPrefixSize = 2;
 
 // Walks a stream of [2-byte big-endian length][message] records.

@@ -7,6 +7,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "obe/gen/synthetic_feed.hpp"
@@ -120,6 +121,40 @@ TEST(Parser, PeekReadsHeaderFieldsWithoutDecoding) {
     EXPECT_EQ(frame.type(), 'D');
     EXPECT_EQ(peek_locate(frame), 0xbeef);
     EXPECT_EQ(peek_timestamp(frame), 0x0000a1a2a3a4ULL);
+}
+
+TEST(Parser, PeekOrderRefFindsTheReferenceInAllSevenOrderMessages) {
+    // The order reference number is at offset 11 in every order message. The
+    // prefetch experiment relies on reading it without decoding the message.
+    for (const char type : kMessageTypes) {
+        Wire w(type, message_size(type));
+        if (w.size() >= 19) {
+            w.u64(11, 0x1122334455667788ULL);
+        }
+        const Frame frame{.data = w.data(), .size = w.size()};
+        OrderId ref = 0;
+        const bool is_order_message =
+            std::string_view("AFECXDU").find(type) != std::string_view::npos;
+        EXPECT_EQ(peek_order_ref(frame, ref), is_order_message) << type;
+        if (is_order_message) {
+            EXPECT_EQ(ref, 0x1122334455667788ULL) << type;
+        } else {
+            EXPECT_EQ(ref, 0U) << "must be left alone for '" << type << "'";
+        }
+    }
+}
+
+TEST(Parser, PeekOrderRefRefusesAFrameTooShortToHoldOne) {
+    // A truncated order message must not be read past its end. The buffer is
+    // sized exactly so AddressSanitizer would catch that.
+    for (const std::size_t size :
+         {std::size_t{0}, std::size_t{1}, std::size_t{11}, std::size_t{18}}) {
+        std::vector<std::byte> bytes(size, static_cast<std::byte>('D'));
+        bytes.shrink_to_fit();
+        const Frame frame{.data = bytes.data(), .size = bytes.size()};
+        OrderId ref = 0;
+        EXPECT_FALSE(peek_order_ref(frame, ref)) << size;
+    }
 }
 
 // --- Malformed input ----------------------------------------------------------------

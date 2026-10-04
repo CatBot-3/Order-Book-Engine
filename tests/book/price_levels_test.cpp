@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "obe/book/concepts.hpp"
@@ -168,6 +169,74 @@ TYPED_TEST(PriceLevelsTest, TheTwoSidesAreIndependent) {
     EXPECT_TRUE(this->bids.remove(100, 10));
     EXPECT_TRUE(this->bids.empty());
     EXPECT_EQ(this->asks.best(), (Level{100, 20}));
+}
+
+TYPED_TEST(PriceLevelsTest, ManyLevelsAddedInRandomOrderComeBackSorted) {
+    // 5'000 distinct prices in a shuffled order, so most inserts land in the
+    // middle of whatever is already there, not at either end.
+    constexpr Price kLevels = 5'000;
+    std::vector<Price> prices;
+    prices.reserve(kLevels);
+    for (Price i = 0; i < kLevels; ++i) {
+        prices.push_back(100'000 + i * 100);
+    }
+    gen::SplitMix64 rng(0x5eed);
+    for (std::size_t i = prices.size() - 1; i > 0; --i) {
+        std::swap(prices[i], prices[rng.below(i + 1)]);
+    }
+    for (const Price p : prices) {
+        this->bids.add(p, 10);
+        this->asks.add(p, 20);
+    }
+    ASSERT_EQ(this->bids.size(), kLevels);
+    ASSERT_EQ(this->asks.size(), kLevels);
+
+    const std::vector<Level> bid_walk = all(this->bids);
+    const std::vector<Level> ask_walk = all(this->asks);
+    ASSERT_EQ(bid_walk.size(), kLevels);
+    ASSERT_EQ(ask_walk.size(), kLevels);
+    for (Price i = 0; i < kLevels; ++i) {
+        ASSERT_EQ(ask_walk[i], (Level{100'000 + i * 100, 20})) << "ask level " << i;
+        ASSERT_EQ(bid_walk[i], (Level{100'000 + (kLevels - 1 - i) * 100, 10})) << "bid level " << i;
+    }
+
+    // Remove them all in a different shuffled order.
+    for (std::size_t i = prices.size() - 1; i > 0; --i) {
+        std::swap(prices[i], prices[rng.below(i + 1)]);
+    }
+    for (const Price p : prices) {
+        ASSERT_TRUE(this->bids.remove(p, 10)) << p;
+        ASSERT_TRUE(this->asks.remove(p, 20)) << p;
+    }
+    EXPECT_TRUE(this->bids.empty());
+    EXPECT_TRUE(this->asks.empty());
+}
+
+TYPED_TEST(PriceLevelsTest, UpdatesDeepInTheBookLeaveTheBestUntouched) {
+    for (Price i = 0; i < 300; ++i) {
+        this->bids.add(50'000 - i * 100, 100);  // best bid 50'000, worst 20'100
+        this->asks.add(50'100 + i * 100, 100);  // best ask 50'100, worst 80'000
+    }
+    // Add beyond the worst level, then in the middle, then remove them again.
+    this->bids.add(10'000, 5);
+    this->asks.add(90'000, 5);
+    this->bids.add(35'050, 6);
+    this->asks.add(65'050, 6);
+    EXPECT_EQ(this->bids.size(), 302U);
+    EXPECT_EQ(this->asks.size(), 302U);
+    EXPECT_EQ(this->bids.best(), (Level{50'000, 100}));
+    EXPECT_EQ(this->asks.best(), (Level{50'100, 100}));
+    EXPECT_EQ(all(this->bids).back(), (Level{10'000, 5}));
+    EXPECT_EQ(all(this->asks).back(), (Level{90'000, 5}));
+
+    EXPECT_TRUE(this->bids.remove(35'050, 6));
+    EXPECT_TRUE(this->asks.remove(65'050, 6));
+    EXPECT_TRUE(this->bids.remove(10'000, 5));
+    EXPECT_TRUE(this->asks.remove(90'000, 5));
+    EXPECT_EQ(this->bids.size(), 300U);
+    EXPECT_EQ(this->asks.size(), 300U);
+    EXPECT_EQ(this->bids.best(), (Level{50'000, 100}));
+    EXPECT_EQ(this->asks.best(), (Level{50'100, 100}));
 }
 
 // Model-based test: random adds and removes on a narrow price band, checked

@@ -1,97 +1,125 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
 #include <optional>
+#include <utility>
 
 #include "obe/book/concepts.hpp"
 #include "obe/book/types.hpp"
 #include "obe/types.hpp"
-#include "obe/util/todo.hpp"
 
-// ============================================================================
-//  YOURS TO WRITE (spec section 10: the price levels are written by hand)
-// ============================================================================
+// The reference price levels: one side of one book, built on std::map. For
+// each price it keeps the total displayed shares resting there.
 //
-// PriceLevels is one side of one book in the reference implementation of
-// phase 2: for each price, the total displayed shares resting there. The spec
-// fixes the container for the reference version, std::map.
+// Its contract is PriceLevelsLike in obe/book/concepts.hpp and its judge is
+// tests/book/price_levels_test.cpp.
 //
-// The interface and its contract are in obe/book/concepts.hpp
-// (PriceLevelsLike). The judge is tests/book/price_levels_test.cpp. Every
-// function below currently throws; replace each util::todo(...) with the real
-// body and add whatever private members you need.
+// The decisions in this file:
 //
-// Things to settle before writing it:
+//   Which end is "best". std::map iterates in ascending price order. The best
+//   ask is the lowest price (the front) and the best bid is the highest (the
+//   back). One class serves both sides and branches on a stored flag to pick
+//   the end. The alternatives were a comparator chosen by a template parameter
+//   (bids and asks become two different types, and Book and the concept have
+//   to know) or negating the key for bids (no branch, but every price that
+//   crosses the interface has to be converted back, which is easy to get wrong
+//   in exactly one place). The branch is the simplest thing that is obviously
+//   right, and "obviously right" is the reference's whole job. Whether the
+//   branch costs anything is a question for the optimized version.
 //
-//  1. Which end is "best"?
-//     std::map iterates in ascending key order. The best ask is the lowest
-//     price and the best bid is the highest, and this one class serves both
-//     sides. There are at least three ways to arrange that:
-//       (a) a comparator chosen by a template parameter, so bids and asks are
-//           two different types;
-//       (b) one map type, and a branch on the side that picks the front or the
-//           back;
-//       (c) one map type whose key is transformed for one side so that
-//           ascending order is already best-first.
-//     Which costs a branch per call? Which duplicates code or changes the
-//     concept? Which makes for_each awkward? Pick one and write the reason in
-//     docs/design.md. The reason is worth more than the choice.
+//   A level that reaches zero is erased. If it were left behind, best() would
+//   report a price with no shares, Book::bbo() would publish it as the best
+//   bid or offer, and every consumer downstream would see a quote nobody can
+//   trade against.
 //
-//  2. A level whose quantity reaches zero must be erased, not left at zero.
-//     Trace what Book::bbo() would report for a side whose best level is an
-//     empty husk. (This is the "empty level left behind" counter in the spec.)
+//   remove() refuses, and changes nothing, when the level is missing or holds
+//   fewer shares than asked. "Take what is there" would keep the replay going
+//   with a book that is quietly wrong; refusing turns the same event into a
+//   counter that is not zero at the end of the day, which is easy to notice.
 //
-//  3. remove() on a missing level, or for more shares than the level holds,
-//     returns false and changes nothing. Why "changes nothing" and not "take
-//     what is there"? Think about which is easier to notice during a
-//     ten-gigabyte replay: a counter that is not zero, or a book that is
-//     quietly a little wrong.
+//   Level quantities are 64-bit. One order is at most 2^32 - 1 shares, but a
+//   level is the sum of every order at that price, and a few large orders are
+//   enough to pass 32 bits.
 //
-//  4. Level quantities are 64-bit while order sizes are 32-bit. Why is the
-//     wider type needed on one and not the other?
-//
-//  5. What is the cost of add() and remove() in terms of the number of levels,
-//     and where in the book do most updates land on a liquid stock? Hold on to
-//     your answer: it is the hypothesis behind phase 4 experiment 3, and the
-//     cache-miss counter is how you will test it.
-//
-// for_each is a template so the visitor is inlined; there is no std::function
-// here. It must stop as soon as the visitor returns false (book_view asks for
-// the top N levels and should not pay for the rest).
+// Why std::map is slow at this job, which is what phase 4 measures: add and
+// remove are O(log L) pointer hops through tree nodes that were allocated one
+// at a time, and creating or emptying a level calls the allocator. On a liquid
+// stock most updates land within a few levels of the best price, so the tree
+// pays its full depth to reach a place a contiguous array would have had in
+// cache.
 
 namespace obe::book {
 
-class PriceLevels {
+template <class Allocator = std::allocator<std::pair<const Price, std::uint64_t>>>
+class BasicPriceLevels {
  public:
-    // An empty side. Remember which side this is: it decides what "best" means.
-    explicit PriceLevels(Side side) { static_cast<void>(side); }
+    // An empty side. `side` decides which end is best.
+    explicit BasicPriceLevels(Side side) noexcept : is_bid_(side == Side::Buy) {}
 
     // Adds qty shares at price, creating the level if needed. qty > 0.
-    void add(Price price, Qty qty) { util::todo("PriceLevels::add", price, qty); }
+    void add(Price price, Qty qty) { levels_[price] += qty; }
 
     // Takes qty shares off the level at price and erases the level if that
     // empties it. Returns false, changing nothing, if there is no such level
     // or it holds fewer than qty shares. qty > 0.
-    bool remove(Price price, Qty qty) { util::todo("PriceLevels::remove", price, qty); }
+    bool remove(Price price, Qty qty) {
+        const auto it = levels_.find(price);
+        if (it == levels_.end() || it->second < qty) {
+            return false;
+        }
+        it->second -= qty;
+        if (it->second == 0) {
+            levels_.erase(it);
+        }
+        return true;
+    }
 
     // The best level: highest price for Buy, lowest for Sell. nullopt if empty.
-    std::optional<Level> best() const { util::todo("PriceLevels::best"); }
+    [[nodiscard]] std::optional<Level> best() const {
+        if (levels_.empty()) {
+            return std::nullopt;
+        }
+        const auto& [price, qty] = is_bid_ ? *levels_.rbegin() : *levels_.begin();
+        return Level{price, qty};
+    }
 
-    bool empty() const { util::todo("PriceLevels::empty"); }
+    [[nodiscard]] bool empty() const noexcept { return levels_.empty(); }
 
     // Number of price levels.
-    std::size_t size() const { util::todo("PriceLevels::size"); }
+    [[nodiscard]] std::size_t size() const noexcept { return levels_.size(); }
 
     // Calls visit(const Level&) from best to worst. Stops when visit returns
-    // false.
+    // false. A template, so the visitor is inlined; no std::function.
     template <class Visitor>
     void for_each(Visitor&& visit) const {
-        util::todo("PriceLevels::for_each", visit);
+        if (is_bid_) {
+            // A plain reverse-iterator loop: std::views::reverse would pull in
+            // <ranges>, which older Clang releases cannot compile against
+            // libstdc++. NOLINTNEXTLINE(modernize-loop-convert)
+            for (auto it = levels_.rbegin(); it != levels_.rend(); ++it) {
+                if (!visit(Level{it->first, it->second})) {
+                    return;
+                }
+            }
+        } else {
+            for (const auto& [price, qty] : levels_) {
+                if (!visit(Level{price, qty})) {
+                    return;
+                }
+            }
+        }
     }
 
  private:
-    // Your storage goes here.
+    std::map<Price, std::uint64_t, std::less<Price>, Allocator> levels_;
+    bool is_bid_;
 };
+
+using PriceLevels = BasicPriceLevels<>;
 
 static_assert(PriceLevelsLike<PriceLevels>);
 

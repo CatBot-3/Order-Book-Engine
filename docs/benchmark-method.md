@@ -22,11 +22,33 @@ Two workloads, chosen with `--handler`:
 | `book` (default) | framing, type dispatch, decode, and the book update for every message | the headline numbers |
 | `parse` | framing, type dispatch, and decode into a checksum | separating feed cost from book cost |
 
-`book` is `BookManager<OrderStore, PriceLevels>` with no listener attached.
-Detecting a best-bid-and-offer change (reading the best level of each side and
-comparing) is inside the measurement; delivering it to a consumer is not,
-because there is no consumer yet. That changes in phase 6 and this file must
-change with it.
+`book` is a `BookManager` with no listener attached. Detecting a
+best-bid-and-offer change (reading the best level of each side and comparing)
+is inside the measurement; delivering it to a consumer is not, because there is
+no consumer yet. That changes in phase 6 and this file must change with it.
+
+Which containers the book uses is chosen with `--impl`
+(`book_replay --list` prints the names):
+
+| `--impl` | Order store | Price levels | Experiment |
+|---|---|---|---|
+| `reference` (default) | `std::unordered_map` | `std::map` | the baseline |
+| `flat-store` | `FlatOrderStore` | `std::map` | 1 |
+| `vector-levels` | `std::unordered_map` | `VectorPriceLevels` | 3 |
+| `pooled` | `std::unordered_map`, pooled nodes | `std::map`, pooled nodes | 4 |
+| `flat-vector` | `FlatOrderStore` | `VectorPriceLevels` | 1 and 3 together |
+
+Each one differs from the reference in one respect, so one comparison isolates
+one effect. The other switches each belong to an experiment as well:
+
+| Switch | What it changes | Notes |
+|---|---|---|
+| `--reserve N` | pre-sizes the order store for N resting orders | Use the peak that `feed_profile` reports. Give "before" and "after" the same value, or the comparison measures the reservation and not the container |
+| `--prefetch` | the loop reads one message ahead and calls `prefetch(id)` on the order store for the order the next message refers to | Does nothing for a store without a `prefetch` member. The read-ahead itself is inside the timed region |
+| `--symbols A,B,C` | only these securities' messages are applied | Every message is still framed and counted, and every figure is per message read. The share actually applied is printed |
+
+`--prefetch` and `--symbols` cannot be combined: they are separate experiments
+and separate loops.
 
 ## 2. What is inside the timed region
 
@@ -119,10 +141,12 @@ noise.
 ## 6. What the report records
 
 So that a number can be reproduced or challenged later, every report states:
-file name, size and message count; workload; CPU model, logical CPU count,
-memory; whether a hypervisor is present and whether it is WSL; pinned CPU;
-governor; kernel; compiler and version; build type and flags; clock and its
-calibration; timer cost; and, for `book`, the correctness line.
+file name, size and message count; workload and implementation; any
+reservation, prefetch or symbol filter; CPU model, logical CPU count, memory;
+whether a hypervisor is present and whether it is WSL; pinned CPU; governor;
+the transparent huge page setting and the huge-page bytes in use; kernel;
+compiler and version; build type and flags; clock and its calibration; timer
+cost; and, for `book`, the correctness lines.
 
 `--json FILE` writes the same data in a form scripts can read.
 `scripts/run_bench.sh` saves both, plus the git commit, under `results/`.
@@ -136,6 +160,17 @@ best-bid-and-offer stream.
 A speed number is only worth anything next to proof that the book was right. In
 phase 4 the rule is: **an optimized build's hash must equal the reference
 build's hash on the same file, or its timings are discarded.**
+
+The tool enforces that rule. For any `--impl` other than `reference` it also
+replays the file through the reference book, untimed, and compares the two
+hashes. If they differ the report says the timings are void and the exit
+status is 3. The reference replay is one more untimed pass over the file.
+`--no-verify` skips it; the report then says the comparison was not made, and
+such a run must not be quoted.
+
+The check always uses the whole file, even with `--symbols`.
+`scripts/diff_books.sh` makes the same comparison security by security, which
+is how to find where two books first disagree.
 
 Each run also produces a digest of the handler's final state. If two runs
 disagree the tool says so; that would mean the workload is not deterministic.
@@ -179,6 +214,20 @@ then says so and reports timings only. It does not guess.
 6. **`-march=native` changes the result** and makes the binary non-portable. It
    is off by default (`OBE_NATIVE`). If it is turned on, the flags line in the
    report shows it; record it as an experiment, not as a silent default.
+7. **Link-time and profile-guided optimization are experiments too.** The
+   `release-lto` preset and `scripts/pgo_build.sh` produce separate builds, and
+   the flags line shows `-flto` or `-fprofile-use`. A profile trained on the
+   same file that is then measured is the best case for PGO; say what the
+   training data was.
+8. **Huge pages are a request.** `util::HugePageBuffer` asks for them and the
+   kernel may decline. The report prints the system setting and how many bytes
+   of the process were huge-page backed after the runs. If that is zero, the
+   run was not a huge-page run, whatever the code asked for.
+9. **The pooled implementation shares one pool per node type** across every
+   book and across runs in the same process. A later run therefore starts with
+   a warm pool. That is the steady state a long-running system would be in,
+   but it is not the same starting point as the reference, whose allocator
+   also carries state between runs in its own way.
 
 ## 10. Before quoting a number
 
