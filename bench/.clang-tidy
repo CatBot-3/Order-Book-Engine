@@ -1,0 +1,4 @@
+# Google Benchmark's `for (auto _ : state)` idiom never reads `_`, which the
+# dead-store check reports on every benchmark. Everything else is inherited.
+InheritParentConfig: true
+Checks: '-clang-analyzer-deadcode.DeadStores'

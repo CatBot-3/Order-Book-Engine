@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.compiler.name }} / ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - { name: gcc-13, cxx: g++-13 }
+          - { name: clang-18, cxx: clang++-18 }
+        preset: [debug, release]
+    env:
+      CXX: ${{ matrix.compiler.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test the finished parts
+        run: ctest --preset ${{ matrix.preset }} -LE needs-your-code
+      # The order store and price levels are written by hand. This step is red
+      # until they are, and names the missing functions.
+      - name: Test the hand-written parts
+        run: ctest --preset ${{ matrix.preset }} -L needs-your-code
+
+  tsan:
+    name: clang-18 / tsan
+    runs-on: ubuntu-24.04
+    env:
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake --preset tsan
+      - name: Build
+        run: cmake --build --preset tsan
+      - name: Test the finished parts
+        run: ctest --preset tsan -LE needs-your-code
+      - name: Test the hand-written parts
+        run: ctest --preset tsan -L needs-your-code
+
+  fuzz:
+    name: clang-18 / fuzz smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake --preset fuzz -DCMAKE_CXX_COMPILER=clang++-18
+      - name: Build
+        run: cmake --build --preset fuzz
+      - name: Fuzz the parser for one minute
+        run: |
+          mkdir -p fuzz/corpus
+          build/fuzz/fuzz/parser_fuzz -max_len=4096 -max_total_time=60 fuzz/corpus fuzz/seeds
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: bash scripts/check_format.sh clang-format-18
+
+  # Advisory: reports lint findings without failing the workflow.
+  tidy:
+    name: clang-tidy (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    env:
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-tidy-18
+      - name: Configure
+        run: cmake --preset debug -B build/clang-debug
+      - name: Build
+        run: cmake --build build/clang-debug
+      - name: clang-tidy
+        run: bash scripts/run_tidy.sh build/clang-debug clang-tidy-18

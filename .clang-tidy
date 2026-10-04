@@ -1,0 +1,31 @@
+# Checks that have earned their place here. Each exclusion has a reason:
+#   bugprone-easily-swappable-parameters   fires on every (price, qty) pair
+#   bugprone-exception-escape              noisy with stubs that throw by design
+#   bugprone-unchecked-optional-access     loses track of checks across loops and
+#                                          early returns; false positives in apps/
+#   bugprone-branch-clone                  flags argument parsers whose branches
+#                                          are intentionally alike
+#   performance-enum-size                  one-byte enums are not worth the noise
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -bugprone-unchecked-optional-access,
+  -bugprone-branch-clone,
+  clang-analyzer-*,
+  performance-*,
+  -performance-enum-size,
+  portability-*,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-loop-convert,
+  readability-braces-around-statements,
+  readability-const-return-type,
+  readability-container-size-empty,
+  readability-else-after-return,
+  readability-misleading-indentation,
+  readability-redundant-control-flow,
+  readability-simplify-boolean-expr
+HeaderFilterRegex: '(include/obe|apps|bench|tests|fuzz)/.*'
+FormatStyle: file

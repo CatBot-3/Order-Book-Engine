@@ -1,0 +1,7 @@
+# The repo is edited from Windows and built in WSL2. Keep LF everywhere so the
+# shell scripts still run after a Windows checkout.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.gz binary
+*.itch binary

@@ -1,0 +1,40 @@
+# Build output
+build/
+out/
+cmake-build-*/
+compile_commands.json
+CMakeUserPresets.json
+
+# Market data is never committed (spec 4.1). Fetch it with scripts/fetch_data.sh.
+data/
+*.NASDAQ_ITCH50
+*.NASDAQ_ITCH50.gz
+*.itch
+*.itch.gz
+*.md5sum
+
+# Benchmark output from local runs. Copy the numbers you keep into docs/.
+results/
+perf.data
+perf.data.old
+
+# Fuzzing
+fuzz/corpus/
+crash-*
+leak-*
+timeout-*
+oom-*
+
+# Editors and tools
+.vscode/
+.idea/
+.cache/
+*.swp
+__pycache__/
+*.pyc
+.DS_Store
+
+# Private planning notes. The project spec holds resume and job-search notes,
+# so it stays out of the public repo.
+/Order Book Engine - Project Spec.md
+/notes/
