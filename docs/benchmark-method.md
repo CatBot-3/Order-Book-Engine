@@ -208,9 +208,10 @@ then says so and reports timings only. It does not guess.
 3. **Single thread.** One core, no contention. Phase 6 measures the pipeline.
 4. **One file is one day.** A quiet day and a volatile day have different
    message mixes and book depths. State which file was used.
-5. **Synthetic data is not evidence.** `itch_synth` output is for checking that
-   the harness runs. Its order flow is random, so cache behaviour on it says
-   nothing about real data. No number measured on it belongs in the README.
+5. **Synthetic data is not evidence.** `itch_synth` and `flow_gen` output is
+   for checking that the harness runs. Their order flow is random, so cache
+   behaviour on it says nothing about real data. No `replay_bench` number
+   measured on it belongs in the README.
 6. **`-march=native` changes the result** and makes the binary non-portable. It
    is off by default (`OBE_NATIVE`). If it is turned on, the flags line in the
    report shows it; record it as an experiment, not as a silent default.
@@ -240,7 +241,45 @@ then says so and reports timings only. It does not guess.
 7. For `book`: invariants zero and the hash matches the reference.
 8. If it was measured in a VM or WSL2, it says so.
 
-## 11. Micro benchmarks
+## 11. The matching engine benchmark
+
+`build/release/bench/engine_bench` times a matching engine. The rules above
+apply to it unchanged: release build, pinned thread, warm-up runs, at least
+five measured runs, median with the range, timer cost next to every
+percentile. What differs is the input.
+
+```sh
+build/release/bench/engine_bench --engine reference --cpu 2 --label reference
+build/release/bench/engine_bench --engine pooled --cpu 2 --label pooled
+```
+
+1. **The input is a tape of requests,** generated once by running the seeded
+   order flow through the reference engine. Generating requests is not inside
+   any timed region. It could not be: the generator decides its next request
+   from the engine's reports, and its own cost is larger than the engine's.
+2. **Timing starts on a full book.** The requests up to the point where the
+   book first reached its target number of resting orders are applied before
+   the clock starts. The report states how many those were. What is measured
+   is steady state, not an empty book filling up.
+3. **What is inside the timed region:** `submit`, `cancel` or `replace` for one
+   request, including building every report and market-data message it
+   produces and handing them to the sinks.
+4. **What the sinks do is a switch.** `--sinks null` (the default) drops the
+   output, so the figure is matching and book-keeping alone. `--sinks feed`
+   encodes every market-data message to bytes, as a publisher would. Compare
+   two engines with the same setting, and say which it was.
+5. **Correctness is part of the report here too.** Before timing, the tape is
+   replayed through the engine with hashing sinks. If its market data or its
+   reports hash differently from the reference engine's, the report says the
+   timings are void and the exit status is 3. `--no-verify` skips the check
+   and such a run must not be quoted.
+6. **The flow is synthetic.** More than half of the requests are new orders,
+   and trades are a larger share of activity than on a real day. The numbers
+   are for comparing one engine with another on identical input. They are not
+   a claim about what an exchange does, and they do not belong in the results
+   table next to numbers measured on Nasdaq data without that label.
+
+## 12. Micro benchmarks
 
 `build/release/bench/micro_bench` (Google Benchmark) times single operations:
 a big-endian load, one decode, a parse of a synthetic stream, a histogram

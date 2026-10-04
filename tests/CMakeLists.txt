@@ -48,6 +48,22 @@ obe_add_test(
   SOURCES ${OBE_BOOK_TEST_SOURCES} book/differential_test.cpp util/pool_test.cpp)
 target_compile_definitions(obe_hand_written_tests PRIVATE OBE_TEST_HAND_WRITTEN)
 
+# The matching engine (phase 5). The same split as the book: the suites run on
+# the reference engine in the passing build, and again on the hand-written
+# MatchingEngine, with the differential test against the reference added.
+set(OBE_ENGINE_TEST_SOURCES engine/engine_scenario_test.cpp engine/engine_property_test.cpp
+                            engine/round_trip_test.cpp)
+obe_add_test(
+  obe_engine_tests
+  LABELS unit
+  SOURCES ${OBE_ENGINE_TEST_SOURCES} engine/feed_writer_test.cpp gen/order_flow_test.cpp)
+
+obe_add_test(
+  obe_hand_written_engine_tests
+  LABELS needs-your-code
+  SOURCES ${OBE_ENGINE_TEST_SOURCES} engine/engine_differential_test.cpp)
+target_compile_definitions(obe_hand_written_engine_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+
 # The integration tests below are shell scripts. They are run through bash
 # explicitly so they work on a checkout that lost its executable bits, which is
 # what a repository kept on a Windows drive and built from WSL tends to be.
@@ -131,4 +147,46 @@ if(OBE_BUILD_APPS AND OBE_BASH)
       $<TARGET_FILE:book_replay> --synth $<TARGET_FILE:itch_synth> --workdir
       "${CMAKE_CURRENT_BINARY_DIR}")
   set_tests_properties(optimized_books_match_reference PROPERTIES LABELS "needs-your-code")
+endif()
+
+# Success criterion 7 through the real apps: the matching engine's published
+# feed, written to a file, replays cleanly through book_replay and is never
+# locked or crossed.
+if(OBE_BUILD_APPS AND OBE_BASH)
+  add_test(
+    NAME engine_feed_round_trip
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/flow_round_trip.sh" $<TARGET_FILE:flow_gen>
+      $<TARGET_FILE:book_replay> "${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(engine_feed_round_trip PROPERTIES LABELS "integration")
+
+  # The same, for the hand-written engine, and its output against the
+  # reference engine's.
+  add_test(
+    NAME hand_written_engine_feed_round_trip
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/flow_round_trip.sh" $<TARGET_FILE:flow_gen>
+      $<TARGET_FILE:book_replay> "${CMAKE_CURRENT_BINARY_DIR}" --engine pooled)
+  set_tests_properties(hand_written_engine_feed_round_trip PROPERTIES LABELS "needs-your-code")
+
+  add_test(NAME engines_match_reference
+           COMMAND "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/diff_engines.sh" --flow-gen
+                   $<TARGET_FILE:flow_gen>)
+  set_tests_properties(engines_match_reference PROPERTIES LABELS "needs-your-code")
+endif()
+
+if(OBE_BUILD_BENCH AND OBE_BASH)
+  add_test(
+    NAME engine_bench_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/engine_bench_smoke.sh" null
+      $<TARGET_FILE:engine_bench> "${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(engine_bench_smoke PROPERTIES LABELS "integration")
+
+  add_test(
+    NAME engine_bench_feed_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/engine_bench_smoke.sh" feed
+      $<TARGET_FILE:engine_bench> "${CMAKE_CURRENT_BINARY_DIR}" --sinks feed)
+  set_tests_properties(engine_bench_feed_smoke PROPERTIES LABELS "integration")
 endif()

@@ -8,6 +8,7 @@
 
 #include "obe/feed/codec.hpp"
 #include "obe/feed/messages.hpp"
+#include "obe/gen/rng.hpp"
 #include "obe/types.hpp"
 
 // A seeded generator of well-formed ITCH streams.
@@ -20,37 +21,15 @@
 //
 // What it is not: a market model. Executions pick a random resting order, not
 // the best-priced one, and the two sides can cross. Numbers measured on this
-// stream say nothing about real data. The phase 5 generator, which drives the
-// matching engine, replaces it for anything that needs realistic flow.
+// stream say nothing about real data. Where the shape of the book matters, use
+// flow_gen: it drives the matching engine with obe/gen/order_flow.hpp, so its
+// trades follow price-time priority and its books are never crossed. This
+// generator remains the one that emits every ITCH message type.
 //
 // The same config gives the same bytes on every platform and standard library:
 // the generator uses its own PRNG and no std distributions.
 
 namespace obe::gen {
-
-// SplitMix64. Small, fast, and identical everywhere.
-class SplitMix64 {
- public:
-    explicit constexpr SplitMix64(std::uint64_t seed) noexcept : state_(seed) {}
-
-    constexpr std::uint64_t next() noexcept {
-        std::uint64_t z = (state_ += 0x9e3779b97f4a7c15ULL);
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-        return z ^ (z >> 31);
-    }
-
-    // Uniform enough for test data in [0, n). Precondition: n > 0.
-    constexpr std::uint64_t below(std::uint64_t n) noexcept { return next() % n; }
-
-    // Inclusive range. Precondition: lo <= hi.
-    constexpr std::uint64_t between(std::uint64_t lo, std::uint64_t hi) noexcept {
-        return lo + below(hi - lo + 1);
-    }
-
- private:
-    std::uint64_t state_;
-};
 
 struct SyntheticConfig {
     std::uint64_t seed = 1;

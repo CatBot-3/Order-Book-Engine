@@ -31,6 +31,15 @@ if(OBE_SANITIZE)
   add_compile_options(-fsanitize=${_obe_san_arg} -fno-omit-frame-pointer -fno-sanitize-recover=all)
   add_link_options(-fsanitize=${_obe_san_arg})
   message(STATUS "obe: sanitizers enabled: ${_obe_san_arg}")
+  # With AddressSanitizer, also have libstdc++ mark the unused part of every
+  # std::vector as off limits. Without it, reading v[v.size()] is undefined but
+  # lands inside the vector's own allocation, where AddressSanitizer cannot see
+  # it. It must be set for every translation unit that touches a vector, which
+  # is why it is here, next to the sanitizer flags, and global. libc++ does the
+  # same without being asked.
+  if("address" IN_LIST _obe_san_list)
+    add_compile_definitions(_GLIBCXX_SANITIZE_VECTOR)
+  endif()
 endif()
 
 if(OBE_NATIVE)

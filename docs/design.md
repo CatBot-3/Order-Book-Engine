@@ -254,10 +254,18 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Differential | same file | `BookManager` against `NaiveBook`, update for update |
 | Differential | `tests/book/differential_test.cpp`, `scripts/diff_books.sh` | each optimized book against the reference book, security by security |
 | Integration | `ctest` entries in `tests/CMakeLists.txt` | the real apps on a generated file, against the independent Python counter |
+| Engine scenario | `tests/engine/engine_scenario_test.cpp` | every order type and every edge of the engine contract: reports, market data and the book left behind |
+| Engine property | `tests/engine/engine_property_test.cpp` | never crossed, shares conserved, price-time order, determinism, and agreement with an oracle, over seeded random flow |
+| Round trip | `tests/engine/round_trip_test.cpp`, `scripts/flow_round_trip.sh` | the engine's feed, through the feed handler, rebuilds the engine's book |
+| Engine differential | `tests/engine/engine_differential_test.cpp`, `scripts/diff_engines.sh` | the hand-written engine says exactly what the reference says |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
 orders that recomputes the best bid and offer by scanning every order after
 every message. It is far too slow for real data and very hard to get wrong.
+
+`NaiveEngine` (`tests/support/naive_engine.hpp`) is the same idea for the
+matching engine: every resting order of every instrument in one vector, and a
+scan of all of it to find who trades next.
 
 All of this runs under AddressSanitizer and UndefinedBehaviorSanitizer in the
 `debug` preset.
@@ -275,12 +283,14 @@ bodies are left out until they are written.
 | Flat order table (experiment 1) | `include/obe/book/flat_order_store.hpp` | **to write** |
 | Contiguous price levels (experiment 3) | `include/obe/book/vector_price_levels.hpp` | **to write** |
 | Pool (experiment 4, and the engine later) | `include/obe/util/pool.hpp` | **to write** |
-| Matching loop | phase 5 | not started |
+| Reference matching engine | `include/obe/engine/reference_engine.hpp` | written |
+| Matching engine (pooled, intrusive queues) | `include/obe/engine/matching_engine.hpp` | **to write** |
 | Lock-free queue | phase 6 | not started |
 
 Each "to write" header holds the interface, the questions to settle and where
-the measurements that settle them come from. Their tests are built into a
-second executable, `obe_hand_written_tests`, from the same sources as the
+the measurements that settle them come from. Their tests are built into
+second executables (`obe_hand_written_tests` for the containers,
+`obe_hand_written_engine_tests` for the engine) from the same sources as the
 reference tests, and carry the `ctest` label `needs-your-code`:
 
 ```sh
@@ -338,6 +348,10 @@ what the baseline measures and what phase 4 replaces one at a time.
 
 *(yours)*
 
+### 6.6 Matching engine
+
+*(yours)*
+
 ## 7. Phase 4 structure
 
 Phase 4 swaps containers and measures. The structure that makes each swap safe
@@ -380,7 +394,147 @@ already rules out.
 to the store's `prefetch` if it has one and compiles to nothing otherwise, so
 the prefetch experiment needs no change to the contract or to the reference.
 
-## 8. Decisions that are open to change
+## 8. Matching engine (`include/obe/engine`)
+
+### 8.1 Shape
+
+```
+ submit / cancel / replace ──> Engine<Reports, MarketData>
+                                 │                    │
+                 Reports::on_executed ...      MarketData::on_add, on_execute ...
+                 to the order's owner          to everybody, anonymous
+                                                      │
+                                   ItchFeedWriter (bytes)   or   BookManager (directly)
+```
+
+The engine is a class template over its two sinks, for the same reason the
+parser is a template over its handler: the calls are direct and inlinable, and
+a benchmark can plug in sinks that do nothing.
+
+Two audiences hear about every change. The owner gets reports that name the
+order and what happened to it. The market gets ITCH messages that describe the
+displayed book and say nothing about who. An order that trades the moment it
+arrives never appears in the market data as an order: the market only sees the
+resting orders it took shares from. That is why a full fill of an incoming
+order produces `E` messages and no `A`.
+
+`MarketDataSink` is deliberately a subset of the ITCH handler interface. A
+`BookManager` is therefore a market-data sink as it stands, and the engine can
+drive a feed-side book with no bytes in between. `ItchFeedWriter` is the other
+sink: it encodes each message in the layout of Nasdaq's sample files, so
+everything that reads a real day reads the engine's output.
+
+The engine never reads a clock. Every operation takes the time from the
+caller and stamps its output with it. It also assigns the order ids and match
+numbers itself, counting up from one. Together those make a run a pure
+function of its requests, which is what the differential test and the
+before-and-after benchmark both rely on.
+
+### 8.2 The rules, and the ones that are choices
+
+The full contract is the comment at the top of `concepts.hpp`. The parts that
+are design decisions and not arithmetic:
+
+1. **Price, then time.** The best-priced resting order trades first; among
+   orders at one price, the one that has waited longest. Trades happen at the
+   resting order's price, so an aggressive order can do better than its limit
+   and never worse.
+2. **A replace keeps its place only if it shrinks.** Same price and a size no
+   larger: the order keeps its id and its position, and the market sees `X`.
+   A new price or a larger size: the order goes to the back under a new id,
+   and the market sees `U`. If an order could grow in place, one share would
+   be enough to hold a position in the queue for later.
+3. **A replace that trades is published as `D`, `E`..., `A`.** The market data
+   has no way to show an order that executes on arrival, so there is nothing
+   for a `U` to point its new reference number at. The old order is deleted
+   and whatever survives the trades is added afresh.
+4. **Fill-or-kill is decided before the first trade.** A trade cannot be
+   taken back once it is published, so the engine first sums the resting
+   shares at acceptable prices. Level totals make that a walk over levels, not
+   orders.
+5. **A market order never rests.** With no price there is no level to put it
+   on. What it cannot fill is cancelled, with a reason that says the book ran
+   out.
+6. **A refused request changes nothing and uses no id.** The checks run in a
+   fixed order and the first failure is the one reported. The order of the
+   checks is part of the contract only because two engines have to agree on
+   it.
+7. **Self-trading is allowed.** An owner's order can trade with another of
+   their own. Preventing it is on the spec's stretch list.
+
+Left out on purpose: auctions, halts, price bands, lot-size rules, hidden and
+pegged orders. Every instrument trades continuously from the moment it is
+opened.
+
+### 8.3 Two engines
+
+| Name | File | Structure |
+|---|---|---|
+| `reference` | `reference_engine.hpp` | `std::map` of levels, a `std::list` of orders per level, `std::unordered_map` from id to a list iterator |
+| `pooled` | `matching_engine.hpp` | intrusive queues of orders from `util::Pool`; **written by hand** |
+
+`flow_gen --engine NAME` and `engine_bench --engine NAME` select one. The
+reference allocates up to three nodes for an order that rests (list, index,
+and a tree node if the price is new) and frees them when it leaves. That is
+the cost the hand-written engine is there to remove, and `engine_bench` is how
+the difference is measured.
+
+`engine_bench` records the requests once, as a tape, by running the generator
+through the reference engine. It then replays the tape into the engine under
+test: once with hashing sinks, to check that the engine says what the
+reference says, and then for timing. Requests that fill the book to its target
+size are applied before the clock starts, so the measurement is a full book in
+steady state.
+
+### 8.4 How it is tested
+
+A matching engine that is subtly wrong still produces plausible output, so the
+tests look at it from several independent directions:
+
+1. **Scenarios** state, for each order type and edge, the exact reports, the
+   exact market data and the exact book afterwards.
+2. **Properties** over seeded random flow are each checked from a different
+   place: the book is never crossed (from the engine's own book), shares are
+   conserved (from the reports alone), trades follow price then time (from the
+   market data alone, as an outsider would see it), and a seed gives the same
+   bytes twice.
+3. **The oracle.** `NaiveEngine` implements the same contract with no data
+   structure at all. The scenarios run against it too, and the property suite
+   requires the engine under test to match it request by request.
+4. **The round trip.** The published bytes, parsed by the phase 2 feed handler,
+   must rebuild the engine's book. The comparison is made at checkpoints
+   through the run, not only at the end.
+5. **A test of the tests.** `TheFlowsReachEveryPath` fails if the random flows
+   stop producing every reject reason, every cancel reason, both kinds of
+   replace, sweeps, and replaces that trade. Without it the properties could
+   pass on flow that never visits the hard cases.
+6. **The differential test** holds the hand-written engine to the reference's
+   output: market data byte for byte, reports one by one.
+
+### 8.5 The order-flow generator (`include/obe/gen/order_flow.hpp`)
+
+`OrderFlow` produces requests, not messages. Each symbol has a mid price that
+takes a random walk; most orders are placed a few ticks behind it, a minority
+reach across it, and cancels and replaces pick a random resting order. The
+number of resting orders hovers around a target. A small share of requests is
+wrong on purpose, to exercise the rejects.
+
+It learns which orders are resting the way a participant would: it is a report
+sink, and whoever runs the engine routes the reports to it. That is also a
+check on the reports: `flow_gen` fails if the orders the generator believes are
+resting are not the orders in the book.
+
+`flow_gen` runs the generator through an engine and writes the feed to a file.
+It replaces `itch_synth` wherever the shape of the book matters: trades take
+the best price and the oldest order, and the two sides never cross.
+
+It is still not a market. There are no participants with intentions, no
+correlation between symbols, and executions are a larger share of the messages
+than on a real day (`itch_stats` shows the mix of any file). Numbers measured
+on it compare one build of this code with another. They say nothing about
+Nasdaq.
+
+## 9. Decisions that are open to change
 
 These were made to get phases 1 to 3 standing. Each is cheap to revisit.
 
@@ -399,11 +553,21 @@ These were made to get phases 1 to 3 standing. Each is cheap to revisit.
    total of resting shares so `audit()` can compare it with the levels. It is
    one add or subtract per message. If it shows up in a profile it can move
    behind a template flag.
-5. **The synthetic generator is not a market model.** It picks random resting
-   orders to execute. It is for fixtures and for smoke-testing the harness, and
-   numbers measured on it mean nothing about real data. Phase 5 replaces it.
+5. **`itch_synth` is not a market model.** It picks random resting orders to
+   execute. It is for fixtures that need every message type and for
+   smoke-testing the harness. `flow_gen` (section 8.5) is the generator to use
+   when the shape of the book matters.
+6. **Replace quantity means open quantity.** `replace(id, qty, price)` sets the
+   shares the order should have open afterwards. Exchange protocols such as
+   OUCH define it as the order's total size including what has already traded.
+   The gateway (phase 7) can translate; the engine's version needs no memory of
+   past fills.
+7. **The engine's sinks are held by reference.** They outlive the engine and
+   must not call back into it. Holding them by value, as `BookManager` holds
+   its listener, would make the generator's feedback loop awkward: the flow
+   generator is both the source of requests and a report sink.
 
-## 9. Known limits
+## 10. Known limits
 
 1. Linux only: `mmap`, and later `epoll` and `perf`.
 2. GCC and Clang only: `__builtin_bswap*` and, in the benchmark, `rdtsc`.

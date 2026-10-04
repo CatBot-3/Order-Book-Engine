@@ -146,6 +146,7 @@ that is yours.
 | 8 | Huge pages for the order store | `util::HugePageBuffer`; the report prints the system setting and the huge-page bytes in use | Back the flat table's slot array with it | |
 | 9 | Symbol filter: process only a watch list | `replay_bench --symbols A,B,C` | Choose watch lists of different sizes and plot cost against the share of messages applied | |
 | 10 | Link-time and profile-guided optimization | `release-lto` preset; `scripts/pgo_build.sh` | Run them. Expect little from LTO: every app is a single translation unit. Say what the training data for PGO was | |
+| 11 | Matching engine: node-based reference to pooled orders in intrusive queues | `engine_bench --engine reference` and `--engine pooled` on the same recorded tape; the differential test and `scripts/diff_engines.sh` | `include/obe/engine/matching_engine.hpp`. Count the allocations each engine makes per resting order and say which of them the pool removed | |
 
 `--impl flat-vector` combines experiments 1 and 3 for the cumulative row in the
 README's results table.
