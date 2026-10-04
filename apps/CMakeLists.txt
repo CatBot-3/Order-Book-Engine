@@ -11,3 +11,8 @@ obe_add_app(book_replay book_replay.cpp)
 obe_add_app(book_view book_view.cpp)
 obe_add_app(feed_profile feed_profile.cpp)
 obe_add_app(flow_gen flow_gen.cpp)
+
+# The exchange (phase 7): order entry over TCP, market data over UDP. Linux only.
+obe_add_app(exchange_server exchange_server.cpp)
+obe_add_app(load_gen load_gen.cpp)
+obe_add_app(md_listen md_listen.cpp)

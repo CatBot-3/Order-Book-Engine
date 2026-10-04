@@ -5,7 +5,7 @@ Nasdaq's TotalView-ITCH 5.0 binary feed and rebuilds the displayed order book
 of every listed stock, with a correctness check on every book and a
 reproducible latency harness around the whole thing. It is growing into a small
 exchange: a price-time-priority matching engine, a lock-free hand-off between
-threads, and a TCP order gateway.
+threads, a TCP order gateway and a UDP market-data feed.
 
 The rule of the project: prove the book is right, measure before optimizing,
 and log every experiment with a before and an after, including the ones that
@@ -22,7 +22,7 @@ did not help.
 | 4 | Optimization log | harness, tests and tooling ready; the optimized containers are being written; no experiment logged yet |
 | 5 | Matching engine and flow generator | reference engine, flow generator, round trip and tests done; the pooled engine is being written |
 | 6 | Lock-free queue and threaded pipeline | mutex queue, seqlock, three-thread pipeline, benchmarks and tests done; the lock-free ring is being written; nothing measured yet |
-| 7 | TCP gateway and market-data publisher | not started |
+| 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; nothing measured yet |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -44,7 +44,8 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 
  [bench]  latency histogram, hardware counters, report      [gen]  seeded synthetic order flow
 
- planned: [net] epoll gateway, UDP publisher
+ as an exchange:    clients ──TCP──> [net] epoll gateway ──> [engine]
+                    subscribers <──UDP── [net] MoldUDP64-style packets <── market data
 ```
 
 | Directory | Contents |
@@ -53,12 +54,13 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 | `include/obe/book/` | `BookManager`, `Book`, the reference and optimized containers, concepts, the named implementations, hash listener |
 | `include/obe/engine/` | the matching-engine contract, `ReferenceEngine`, the hand-written `MatchingEngine`, `ItchFeedWriter`, the round-trip comparison |
 | `include/obe/pipeline/` | the replay as three threads joined by queues; the top-of-book board |
+| `include/obe/net/` | the order-entry protocol, `OrderGateway` on epoll, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
 | `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock` |
 | `include/obe/gen/` | seeded generators: order flow for the engine, and a raw ITCH stream for fixtures |
-| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth` |
+| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen` |
 | `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `micro_bench` (Google Benchmark) |
 | `tests/`, `fuzz/` | unit, scenario, golden, differential, property and round-trip tests; libFuzzer target |
-| `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, PGO build |
+| `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, latency curve, PGO build |
 | `docs/` | [`design.md`](docs/design.md), [`benchmark-method.md`](docs/benchmark-method.md), [`optimization-log.md`](docs/optimization-log.md) |
 
 The library is header-only. Why each piece is shaped the way it is: see
@@ -190,6 +192,22 @@ F=data/01302019.NASDAQ_ITCH50
    $B/bench/pipeline_bench $F --queue ring --cpus 2,4,6
    ```
 
+9. **The gateway, measured end to end.** An exchange, a market-data
+   subscriber and a load generator, as three processes. The generator sends
+   orders over TCP at a fixed rate and times each one from the moment it was
+   due to the moment it was acknowledged. The subscriber rebuilds the books
+   from the UDP feed and must see no gap.
+
+   ```sh
+   scripts/gateway_smoke.sh $B/apps/exchange_server $B/apps/load_gen $B/apps/md_listen
+
+   $B/apps/md_listen --md 127.0.0.1:9002 &
+   $B/apps/exchange_server --listen 127.0.0.1:9001 --md 127.0.0.1:9002 &
+   $B/apps/load_gen --connect 127.0.0.1:9001 --connections 16 --cpu 4 \
+       --rate 1000,5000,20000,50000,100000 --seconds 10 --json results/load.json
+   scripts/latency_curve.py results/load.json --plot results/latency_curve.png
+   ```
+
 ## Matching rules
 
 These are design choices, stated here so nobody has to infer them from the
@@ -226,6 +244,21 @@ Filled from real runs only. Method, hardware and flags go with every row.
 Every experiment, accepted or rejected, is in
 [`docs/optimization-log.md`](docs/optimization-log.md).
 
+### Order-to-acknowledgement latency
+
+Loopback only: the client and the server are on one machine and no packet
+reaches a network card. These numbers measure the software path (system calls,
+the kernel's TCP stack, the gateway, the engine), not a network. Latency is
+counted from each request's scheduled send time, so a stalled server cannot
+hide its own delay.
+
+| Requests/s | p50 µs | p99 µs | p99.9 µs | max µs | Generator lag max µs |
+|---|---|---|---|---|---|
+| | | | | | |
+
+Filled by `scripts/latency_curve.py` from a real run, with the machine, the
+number of connections and the CPUs each program was pinned to.
+
 ## Testing
 
 | Layer | What it covers |
@@ -236,6 +269,7 @@ Every experiment, accepted or rejected, is in
 | Property | long seeded random sequences against a `std::map` model; for the engine: never crossed, shares conserved, price-time order, determinism |
 | Round trip | the engine's published feed, through the feed handler, rebuilds the engine's book |
 | Concurrency | each queue: every item once, in order, intact, between two threads; the pipeline against the single-threaded replay; the seqlock against torn reads |
+| Network | the gateway over real loopback sockets: partial reads, mid-message disconnects, bad input, slow and paused clients; the feed with packets lost, repeated and reordered; the load generator's schedule against a server that stalls, in simulated time |
 | Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input |
 | Sanitizers | AddressSanitizer and UBSan on all tests; ThreadSanitizer on all of them too, which is what checks the queues' memory ordering |
 | CI | all of the above on GCC and Clang, plus a formatting check |
@@ -246,15 +280,19 @@ Every experiment, accepted or rejected, is in
    exchanges.
 2. Personal hardware. Numbers are from one desktop machine and are labelled
    with it. They are not a claim about production trading systems.
-3. Replay from a file. There is no live feed, no gap recovery and no connection
-   to a real exchange or broker.
-4. Displayed orders only. Hidden liquidity appears in the feed as trade prints
+3. No real exchange. Market data comes from a file or from this project's own
+   exchange. There is no live feed, no connection to a broker, and a gap in the
+   UDP feed is detected but not recovered.
+4. Loopback networking. The gateway's numbers measure the software path on one
+   machine, not a network, and the order-entry protocol has no login or
+   authentication: it is for a lab, not for anything exposed.
+5. Displayed orders only. Hidden liquidity appears in the feed as trade prints
    and is not part of the reconstructed book.
-5. Framing and message types are validated; field values are not.
-6. The matching engine is exercised with synthetic order flow: random orders
+6. Framing and message types are validated; field values are not.
+7. The matching engine is exercised with synthetic order flow: random orders
    around a random-walk mid price. It checks the engine and compares one build
    with another. It is not a model of a market.
-7. Not a trading strategy, and no claim about profit.
-8. Linux only, GCC and Clang only.
+8. Not a trading strategy, and no claim about profit.
+9. Linux only, GCC and Clang only.
 
 This project is not affiliated with or endorsed by Nasdaq.

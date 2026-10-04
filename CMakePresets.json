@@ -120,6 +120,9 @@
       "configurePreset": "tsan",
       "output": {
         "outputOnFailure": true
+      },
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1"
       }
     },
     {

@@ -261,6 +261,10 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Queue contract | `tests/util/queue_test.cpp`, `channel_test.cpp` | order, full and empty on one thread; every item once, in order and intact across two; close and cancel |
 | Pipeline | `tests/pipeline/pipeline_test.cpp` | three threads publish exactly what one thread publishes, on any queue, with any capacity, on bad input, and when a stage throws |
 | Seqlock | `tests/util/seqlock_test.cpp` | a reader never sees a value nobody stored |
+| Wire formats | `tests/net/protocol_test.cpp`, `moldudp_test.cpp` | every order-entry message at hand-built offsets; packet bytes; loss, duplication and reordering of packets |
+| Gateway | `tests/net/gateway_test.cpp` | partial reads, mid-message disconnects, bad input, slow clients, clients that pause and resume, connection limits and identities, over real loopback sockets |
+| Load measurement | `tests/net/open_loop_test.cpp` | due times neither drift nor overflow; a stall is charged to every request due during it, shown against a send-and-wait generator in simulated time |
+| The three programs | `scripts/gateway_smoke.sh` | orders in over TCP, market data out over UDP, the subscriber's book consistent and gap-free |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
 orders that recomputes the best bid and offer by scanning every order after
@@ -291,6 +295,7 @@ bodies are left out until they are written.
 | Matching engine (pooled, intrusive queues) | `include/obe/engine/matching_engine.hpp` | **to write** |
 | Mutex queue, spin channel, seqlock, pipeline | `include/obe/util/mutex_queue.hpp`, `spin_channel.hpp`, `seqlock.hpp`, `include/obe/pipeline/` | written |
 | Lock-free ring | `include/obe/util/spsc_ring.hpp` | **to write** |
+| Gateway, market-data publisher and receiver, load generator | `include/obe/net/`, `apps/` | written |
 
 Each "to write" header holds the interface, the questions to settle and where
 the measurements that settle them come from. Their tests are built into
@@ -670,7 +675,11 @@ threads were pinned to.
 3. **ThreadSanitizer.** This is the test of the memory ordering, and a stress
    run is not. x86 orders stores and loads more strictly than C++ requires, so
    a ring with every ordering relaxed passes a billion-item run on it without
-   error. ThreadSanitizer checks the ordering the code asked for.
+   error. ThreadSanitizer checks the ordering the code asked for. The `tsan`
+   test preset sets `TSAN_OPTIONS=halt_on_error=1`, so a test stops at its
+   first race report. Without it a wrong ordering in a loop that runs a
+   hundred thousand times produces a report for most of them, and a test that
+   should fail in a second runs for many minutes printing them.
 4. **The pipeline against the single thread:** same hash for every security,
    same counters, same final book, on streams of both generators, with queues
    of one slot, on truncated and corrupt input, and with a stage that throws.
@@ -681,7 +690,180 @@ The tests are written to fail cleanly when the ring is not there yet or is
 wrong: a thread's exception is carried back to the test, and every waiting
 loop has a way out.
 
-## 10. Decisions that are open to change
+## 10. Network (`include/obe/net`)
+
+### 10.1 Shape
+
+```
+ load_gen ──TCP, order entry──> OrderGateway ──> engine ──> reports ──TCP──> load_gen
+ (many connections)             (one thread, epoll)   │
+                                                      └──> MoldPacketizer ──UDP──> md_listen
+                                                           market data            MoldReceiver
+                                                                                  -> BookManager
+```
+
+`exchange_server` is the gateway, a matching engine and the publisher in one
+single-threaded process. `load_gen` is the client and `md_listen` is a
+market-data subscriber. With all three running, an order goes in over TCP, is
+matched, is published over UDP, and is rebuilt into a book by the same
+`BookManager` that replays a Nasdaq file.
+
+The spec puts this code in `src/net/`. It is in `include/obe/net/` instead,
+header-only like everything else, because the gateway is a template over the
+engine and there would be nothing left to compile separately.
+
+### 10.2 Order entry (`protocol.hpp`, `order_gateway.hpp`)
+
+**The protocol** is modelled loosely on Nasdaq's OUCH: three requests (enter,
+replace, cancel) and five responses (accepted, executed, cancelled, replaced,
+rejected), each a fixed size, each starting with a type byte. The messages are
+described by the same one-field-list-per-message scheme as the ITCH messages,
+so encode, decode and size cannot disagree, and the sizes are pinned by
+`static_assert`. What is left out is the session layer OUCH rides on (logins,
+heartbeats, sequence numbers, replay after a reconnect): a connection is the
+session.
+
+**Framing.** TCP delivers a stream of bytes with no message boundaries. Here
+the type byte decides how long a message is. The consequence is that an unknown
+type byte is fatal for the connection: nothing says where the next message
+starts.
+
+**One thread, driven by epoll.** A request is read, decoded and handed to the
+engine in one call; the engine's reports land in the output buffers of the
+connections they belong to before that call returns; at the end of each turn of
+the loop every buffer that gained something is written, with one `send` per
+connection. Nothing is locked because nothing is shared. The cost of that
+simplicity is that one core does everything; the threads and queues of section
+9 are what would be put between the gateway and the engine to change that.
+
+The three things a TCP server has to get right:
+
+1. **Partial reads.** One `recv` can return half a message, or three and a
+   half. Each connection keeps the bytes of a request that has not arrived
+   completely, and only whole requests are acted on. In the common case, when
+   nothing is left over from the previous read, requests are served straight
+   out of the read buffer and nothing is copied.
+2. **Slow clients.** A write never blocks. What a socket will not take stays in
+   the connection's buffer and the socket is watched for writability. A client
+   whose backlog passes a limit is disconnected: it must not be able to grow
+   the server's memory, or delay anybody else, by not reading.
+3. **Disconnects at any moment.** A connection that closes in the middle of a
+   message loses that message and nothing else. Its resting orders are
+   cancelled (configurable), in id order so that the market data this
+   publishes is deterministic.
+
+Level-triggered epoll is used, not edge-triggered. Edge-triggered saves a few
+wake-ups and in exchange every handler must read until the socket is empty or
+lose the notification for ever. Level-triggered cannot lose one, and lets a
+read stop after a bounded number of bytes so that one flooding client cannot
+starve the rest of a turn.
+
+`TCP_NODELAY` is set on every connection. Without it the kernel holds a small
+write back while an earlier one is unacknowledged, which can add tens of
+milliseconds to a message of a few dozen bytes.
+
+### 10.3 Market data (`moldudp.hpp`, `udp.hpp`)
+
+Packets follow the shape of Nasdaq's MoldUDP64: a ten-byte session name, the
+sequence number of the first message, a message count, then length-prefixed
+ITCH messages. Every message has a sequence number, so a receiver that keeps
+"the number I expect next" can tell exactly what it missed:
+
+| A packet that starts | means |
+|---|---|
+| at the expected number | the normal case |
+| above it | messages were lost: a gap, counted with its size |
+| below it | a repeat or a late arrival: the messages already seen are skipped |
+
+A heartbeat (count zero) carries the next sequence number, so a loss at the end
+of a burst is noticed without waiting for the next message; the server sends
+one after a second of silence. An end-of-session packet lets subscribers stop.
+
+`MoldPacketizer` and `MoldReceiver` contain no sockets, which is what lets the
+tests lose, repeat and reorder packets on purpose. `UdpSender` and
+`UdpReceiver` put sockets around them; the destination can be a multicast
+group, as an exchange would use, or an ordinary address.
+
+**There is no recovery.** Real MoldUDP64 has a second channel on which a
+receiver asks for a range of messages again. Here a gap is detected, counted
+and reported (`md_listen` exits with status 2), and the subscriber's book is
+wrong from then on. For the same reason a subscriber that starts late has
+missed the instruments and every resting order and cannot catch up.
+
+### 10.4 Measuring it (`load_gen`)
+
+`load_gen` sends the same seeded order flow that drives the engine in the
+tests, over many connections, at a fixed rate, and records how long each
+request takes to be acknowledged.
+
+The schedule is fixed in advance: request *i* is due at `start + i / rate`.
+Latency runs from that due time to the moment the acknowledgement is read, not
+from the moment the request was actually written. The difference is the whole
+point. A generator that waits for each answer before sending the next slows
+down when the server does: during a one-second stall it sends one request and
+records one slow sample, and the thousands of requests that should have been
+sent in that second are never sent and never counted. The stall all but
+vanishes from the percentiles. This is called coordinated omission. With a
+fixed schedule those requests fall due regardless, each is late by as long as
+it waited, and the stall appears at its true size.
+
+A generator on a fixed schedule can itself fall behind, and its lateness then
+lands in the numbers. The report gives the worst lag behind schedule for each
+rate, so that a row where the generator was the bottleneck can be recognised
+and discarded.
+
+Acknowledgements are matched to requests without tokens: the gateway answers a
+connection's requests in the order they arrived, so each acknowledgement
+belongs to the oldest unanswered request on its connection. Executions, and
+cancels the client did not ask for, are not acknowledgements and are skipped.
+
+Running several rates gives the latency-against-throughput curve
+(`scripts/latency_curve.py` prints it as a table and plots it). It is flat,
+then turns sharply upwards at the rate where the slowest part of the path is
+saturated. Rows past that knee show where the capacity is; their latencies
+depend on how long the run was and are not worth quoting.
+
+**All of this is loopback.** Both ends are on one machine and no packet reaches
+a network card. The numbers measure the software path: system calls, the
+kernel's TCP stack, the gateway and the engine. They say nothing about a
+network, and nothing about a machine where the generator and the server do not
+compete for the same cores.
+
+### 10.5 How it is tested
+
+1. **The wire format:** every message at byte offsets built by hand, and the
+   mapping to and from the engine's types.
+2. **The packet logic, without sockets:** exact packet bytes; then loss,
+   duplication, reordering, overlap, truncation at every length, a wrong
+   session, a heartbeat that reveals a loss. The property that matters most is
+   that a loss is never silent: whenever messages were dropped,
+   `complete()` is false and the count of missed messages is exact.
+3. **The gateway, over real loopback sockets, on one thread.** The test is the
+   client and also turns the gateway's event loop by hand, which is possible
+   because nothing in the gateway happens outside `poll()`. That makes cases
+   deterministic that are usually tested with sleeps: a request arriving one
+   byte at a time, three and a half requests in one write, a disconnect in the
+   middle of a message, a byte that is not a request type, a client that never
+   reads, a client that stops reading until the gateway's writes are refused
+   and then reads everything (every answer must still arrive, once and in
+   order), connections over the limit, and a new connection arriving after
+   another has left (it must not inherit an identity still in use).
+4. **The sockets:** datagram boundaries, a feed round trip over a loopback
+   address and over a multicast group (skipped where multicast is not
+   available).
+5. **The measurement itself** (`open_loop.hpp`, `tests/net/open_loop_test.cpp`).
+   The schedule and the matching of acknowledgements are kept apart from the
+   sockets so that the claim of section 10.4 can be checked in simulated time:
+   due times at rates that do not divide a second neither drift nor overflow,
+   and against a server that stalls for one second in ten, the fixed schedule
+   records about 900 slow requests and a 99th percentile inside the stall,
+   where a send-and-wait generator records one slow sample and a 99th
+   percentile equal to the service time.
+6. **The three programs together** (`scripts/gateway_smoke.sh`, a `ctest`
+   entry): every request acknowledged, the subscriber sees the whole feed with
+   no gap and rebuilds a consistent book, the server shuts down cleanly.
+
+## 11. Decisions that are open to change
 
 These were made to get phases 1 to 3 standing. Each is cheap to revisit.
 
@@ -727,8 +909,15 @@ These were made to get phases 1 to 3 standing. Each is cheap to revisit.
     A latency-critical deployment would spin without limit and reserve the
     cores.
 
-## 11. Known limits
+## 12. Known limits
 
-1. Linux only: `mmap`, and later `epoll` and `perf`.
-2. GCC and Clang only: `__builtin_bswap*` and, in the benchmark, `rdtsc`.
-3. One venue, one feed, no gap recovery (a file has no gaps).
+1. Linux only: `mmap`, `epoll`, `perf_event_open`.
+2. GCC and Clang only: `__builtin_bswap*` and, in the benchmarks, `rdtsc`.
+3. One venue, one feed. A gap in the UDP feed is detected and counted, never
+   recovered: there is no re-request channel and no snapshot.
+4. IPv4 only, and host names are not resolved.
+5. Order entry has no session layer: no login, no heartbeat, no resumption
+   after a reconnect, no authentication of any kind. It is for loopback and a
+   lab network, not for anything exposed.
+6. The exchange is one thread. Its throughput is that of one core, and a slow
+   stretch anywhere in the loop delays every client.

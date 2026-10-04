@@ -79,6 +79,14 @@ obe_add_test(obe_hand_written_concurrency_tests LABELS needs-your-code SOURCES
 target_link_libraries(obe_hand_written_concurrency_tests PRIVATE Threads::Threads)
 target_compile_definitions(obe_hand_written_concurrency_tests PRIVATE OBE_TEST_HAND_WRITTEN)
 
+# The network layer (phase 7): the wire formats, the packet sequencing, and the
+# gateway over real loopback sockets.
+obe_add_test(
+  obe_net_tests
+  LABELS unit
+  SOURCES net/protocol_test.cpp net/moldudp_test.cpp net/udp_test.cpp net/gateway_test.cpp
+          net/open_loop_test.cpp)
+
 # The integration tests below are shell scripts. They are run through bash
 # explicitly so they work on a checkout that lost its executable bits, which is
 # what a repository kept on a Windows drive and built from WSL tends to be.
@@ -243,4 +251,26 @@ if(OBE_BUILD_APPS AND OBE_BUILD_BENCH AND OBE_BASH)
       $<TARGET_FILE:flow_gen> $<TARGET_FILE:pipeline_bench> "${CMAKE_CURRENT_BINARY_DIR}"
       --queue ring)
   set_tests_properties(pipeline_bench_ring_smoke PROPERTIES LABELS "needs-your-code")
+endif()
+
+# Success criterion 8 in miniature: the exchange, a market-data subscriber and
+# the load generator, as three processes on loopback.
+if(OBE_BUILD_APPS AND OBE_BASH)
+  add_test(
+    NAME gateway_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/gateway_smoke.sh"
+      $<TARGET_FILE:exchange_server> $<TARGET_FILE:load_gen> $<TARGET_FILE:md_listen>
+      "${CMAKE_CURRENT_BINARY_DIR}")
+  # They bind loopback ports; let nothing else run beside them.
+  set_tests_properties(gateway_smoke PROPERTIES LABELS "integration" RUN_SERIAL TRUE)
+
+  add_test(
+    NAME hand_written_engine_gateway_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/gateway_smoke.sh"
+      $<TARGET_FILE:exchange_server> $<TARGET_FILE:load_gen> $<TARGET_FILE:md_listen>
+      "${CMAKE_CURRENT_BINARY_DIR}" --engine pooled)
+  set_tests_properties(hand_written_engine_gateway_smoke PROPERTIES LABELS "needs-your-code"
+                                                                    RUN_SERIAL TRUE)
 endif()

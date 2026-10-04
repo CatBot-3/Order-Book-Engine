@@ -339,7 +339,59 @@ build/release/bench/pipeline_bench data/<file> --queue ring --cpus 2,4,6
     a best bid or offer, which is what decides how much crosses the second
     queue.
 
-## 13. Micro benchmarks
+## 13. The gateway benchmark
+
+Success criterion 8: order-to-acknowledgement latency at several send rates.
+
+```sh
+build/release/apps/exchange_server --listen 127.0.0.1:9001 --md 127.0.0.1:9002 &
+build/release/apps/load_gen --connect 127.0.0.1:9001 --connections 16 \
+    --rate 1000,5000,20000,50000,100000,200000 --seconds 10 --warmup 2 \
+    --cpu 4 --json results/load.json
+scripts/latency_curve.py results/load.json --plot results/latency_curve.png
+```
+
+1. **Latency is measured from the intended send time.** The schedule is fixed
+   in advance (request *i* is due at `start + i / rate`) and each request's
+   latency runs from its due time to the moment its acknowledgement is read. A
+   generator that instead timed from the actual send, and waited for each
+   answer before sending the next, would send less while the server was slow
+   and so would leave the slow period out of its own data (coordinated
+   omission). `docs/design.md` section 10.4 has the longer explanation.
+2. **The generator's own lateness is reported.** "Lag max" is the furthest the
+   generator fell behind its schedule. That lateness is inside the latencies.
+   If it is not small next to them, the generator was the bottleneck and the
+   row says nothing about the server. Pinning the generator (`--cpu`) to a core
+   the server is not using is the first thing to do about it.
+3. **One clock, one process.** Both ends of each measurement are read from
+   `steady_clock` inside `load_gen`. Nothing depends on two machines' clocks
+   agreeing.
+4. **What an acknowledgement is.** Accepted, Rejected, Replaced, and a
+   Cancelled that the client asked for. Executions, and the cancels that follow
+   an immediate-or-cancel or fill-or-kill order, are consequences of an order
+   that was already acknowledged and are not counted.
+5. **Warm-up.** The first seconds at each rate are sent and not recorded: the
+   book fills, connections' buffers grow to size, caches warm.
+6. **Read the curve, not a row.** Latency is flat while the server keeps up
+   and turns sharply upwards at the rate where it no longer does. Past that
+   point a queue is building, and the latency depends on how long the run
+   lasted. Quote percentiles from rows well below the knee, and quote the
+   knee as the capacity.
+7. **Report the tail.** p50 says what a typical request sees; p99 and p99.9
+   are where a pause in the server, a full socket buffer or a scheduler
+   decision shows. With ten seconds at a thousand requests a second there are
+   ten thousand samples, so p99.9 rests on ten of them. Run long enough for
+   the percentile being quoted to rest on at least a few hundred.
+8. **This is loopback.** The client and the server are on one machine and the
+   packets never leave the kernel. The numbers are the software path: system
+   calls, the TCP stack, the gateway, the engine. They are not a network
+   latency, and on a machine with few cores the two programs also compete with
+   each other. The README states this next to any number from here.
+9. **State the setup:** the number of connections, the engine
+   (`exchange_server --engine`), which CPUs the server and the generator were
+   on, and whether a market-data subscriber was running.
+
+## 14. Micro benchmarks
 
 `build/release/bench/micro_bench` (Google Benchmark) times single operations:
 a big-endian load, one decode, a parse of a synthetic stream, a histogram
