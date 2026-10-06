@@ -109,6 +109,36 @@
 // stats()                       EngineStats.
 //
 // A locate that was never opened behaves as an empty book in every query.
+//
+// ---------------------------------------------------------------------------
+// Restoring (optional)
+// ---------------------------------------------------------------------------
+//
+// An engine can be recovered after a crash by replaying its journal of
+// requests (obe/journal/replay.hpp). That needs nothing beyond the operations
+// above. Replaying a long journal takes as long as the trading it records,
+// though, so an engine may also let its state be saved and loaded directly: a
+// snapshot (obe/journal/snapshot.hpp). An engine that offers the five
+// functions below is Restorable. They are not part of EngineLike, and an
+// engine without them can still be journaled and replayed.
+//
+// symbol(locate)                 The symbol the locate was opened with.
+// counters()                     The last order id and match number given out.
+// restore_instrument(l, symbol)  Opens a book and publishes NOTHING. False if
+//                                the locate is already open.
+// restore_order(l, side, order)  Puts a resting order at the back of its
+//                                level, with the id, owner and token given,
+//                                and publishes and reports NOTHING. False,
+//                                changing nothing, if the instrument is not
+//                                open, the side is invalid, the price or the
+//                                quantity is zero, or the id is already
+//                                resting. Orders of one level must be given
+//                                oldest first, which is the order
+//                                for_each_order visits them in.
+// restore_counters(c, stats)     Sets the counters and the statistics.
+//
+// They are for building an engine up from nothing. Mixing them with trading
+// is not supported.
 
 namespace obe::engine {
 
@@ -185,5 +215,19 @@ concept EngineLike = requires(E engine, const E const_engine, const NewOrder& or
     { const_engine.listed(locate) } -> std::same_as<bool>;
     { const_engine.stats() } -> std::convertible_to<EngineStats>;
 };
+
+// An engine whose state can be saved and loaded without replaying how it got
+// there. See "Restoring" above.
+template <class E>
+concept Restorable =
+    EngineLike<E> &&
+    requires(E engine, const E const_engine, Locate locate, Side side, const feed::Symbol& symbol,
+             const RestingOrder& order, const EngineCounters& counters, const EngineStats& stats) {
+        { const_engine.symbol(locate) } -> std::same_as<feed::Symbol>;
+        { const_engine.counters() } -> std::same_as<EngineCounters>;
+        { engine.restore_instrument(locate, symbol) } -> std::same_as<bool>;
+        { engine.restore_order(locate, side, order) } -> std::same_as<bool>;
+        engine.restore_counters(counters, stats);
+    };
 
 }  // namespace obe::engine

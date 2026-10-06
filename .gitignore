@@ -20,10 +20,15 @@ perf.data.old
 
 # Fuzzing
 fuzz/corpus/
+fuzz/journal_corpus/
 crash-*
 leak-*
 timeout-*
 oom-*
+
+# Journals and snapshots written by engine_journal and journal_bench
+*.journal
+*.snapshot
 
 # Editors and tools
 .vscode/

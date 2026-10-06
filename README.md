@@ -7,7 +7,8 @@ reproducible latency harness around the whole thing. It is growing into a small
 exchange: a price-time-priority matching engine, a lock-free hand-off between
 threads, a TCP order gateway and a UDP market-data feed. A market-making
 simulator replays the feed and asks what would have happened to quotes placed
-in it.
+in it. The engine can keep a journal of its requests and come back from being
+killed holding exactly what it held.
 
 The rule of the project: prove the book is right, measure before optimizing,
 and log every experiment with a before and an after, including the ones that
@@ -26,6 +27,7 @@ did not help.
 | 6 | Lock-free queue and threaded pipeline | mutex queue, seqlock, three-thread pipeline, benchmarks and tests done; the lock-free ring is being written; nothing measured yet |
 | 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; nothing measured yet |
 | 8 | Market-making simulator | fill model, metrics, two simple strategies and `mm_sim` done; the Avellaneda-Stoikov strategy is being written; not yet run on a real file |
+| 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; nothing measured yet |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -52,6 +54,9 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 
  as a simulation:   file ──> [feed] ──> [sim] fill model + strategy ──> [book]
                                           └──> fills, position, profit, markouts
+
+ surviving a crash: requests ──> [journal] number + checksum ──> file, then ──> [engine]
+                    afterwards:  snapshot + journal ──> replay ──> the same engine
 ```
 
 | Directory | Contents |
@@ -62,12 +67,13 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 | `include/obe/pipeline/` | the replay as three threads joined by queues; the top-of-book board |
 | `include/obe/net/` | the order-entry protocol, `OrderGateway` on epoll, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
 | `include/obe/sim/` | the market-making simulator: fill model, the simple strategies, the hand-written Avellaneda-Stoikov strategy, volatility estimate, report |
+| `include/obe/journal/` | the write-ahead journal: records, writer, a reader that tells a torn tail from damage, replay, snapshots, the file layer, recovery from files |
 | `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock` |
 | `include/obe/gen/` | seeded generators: order flow for the engine, and a raw ITCH stream for fixtures |
-| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen`; `mm_sim` |
-| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `micro_bench` (Google Benchmark) |
-| `tests/`, `fuzz/` | unit, scenario, golden, differential, property and round-trip tests; libFuzzer target |
-| `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, latency curve, PGO build |
+| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen`; `mm_sim`; `engine_journal` |
+| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `journal_bench` (journaling and recovery), `micro_bench` (Google Benchmark) |
+| `tests/`, `fuzz/` | unit, scenario, golden, differential, property, round-trip and recovery tests; libFuzzer targets for the parser and the journal |
+| `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, latency curve, PGO build, the journal crash test |
 | `docs/` | [`design.md`](docs/design.md), [`benchmark-method.md`](docs/benchmark-method.md), [`optimization-log.md`](docs/optimization-log.md) |
 
 The library is header-only. Why each piece is shaped the way it is: see
@@ -94,6 +100,8 @@ experiments.
 cmake --preset fuzz && cmake --build --preset fuzz
 mkdir -p fuzz/corpus
 build/fuzz/fuzz/parser_fuzz -max_len=4096 -max_total_time=60 fuzz/corpus fuzz/seeds
+mkdir -p fuzz/journal_corpus
+build/fuzz/fuzz/journal_fuzz -max_len=2048 -max_total_time=60 fuzz/journal_corpus fuzz/journal_seeds
 ```
 
 ## Data
@@ -230,6 +238,27 @@ F=data/01302019.NASDAQ_ITCH50
     The report ends with the assumptions it rests on. Read them before reading
     the profit line.
 
+11. **The engine survives being killed.** The crash test kills a journaling
+    engine in the middle of its writes, again and again, and requires the
+    journal it ends with to be byte for byte the journal of a run that was
+    never killed. `engine_journal` is the program it drives; `journal_bench`
+    measures what journaling costs on the disk that `--dir` is on, per batch
+    size, with and without `fdatasync`, and how long recovery takes.
+
+    ```sh
+    scripts/journal_crash_test.sh $B/apps/engine_journal
+
+    $B/apps/engine_journal run --journal data/obe.journal --snapshot data/obe.snapshot \
+        --snapshot-every 50000 --commands 1000000 --batch 64 --sync flush
+    $B/apps/engine_journal check --journal data/obe.journal --snapshot data/obe.snapshot
+    $B/apps/engine_journal dump --journal data/obe.journal --limit 20
+
+    $B/bench/journal_bench --dir data --cpu 4 --json results/journal.json
+    ```
+
+    Interrupt the `run` with `kill -9` and start it again with the same
+    options: it says what it recovered from and carries on.
+
 ## Matching rules
 
 These are design choices, stated here so nobody has to infer them from the
@@ -293,7 +322,8 @@ number of connections and the CPUs each program was pinned to.
 | Concurrency | each queue: every item once, in order, intact, between two threads; the pipeline against the single-threaded replay; the seqlock against torn reads |
 | Network | the gateway over real loopback sockets: partial reads, mid-message disconnects, bad input, slow and paused clients; the feed with packets lost, repeated and reordered; the load generator's schedule against a server that stalls, in simulated time |
 | Simulation | each rule of the fill model on hand-built messages; over generated markets, the queue ahead of every quote against the test's own copy of the orders, and the profit recounted from the fills |
-| Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input |
+| Recovery | an engine rebuilt from its journal, or from a snapshot and the journal after it, holds, said and goes on to say exactly what the original did; a journal cut anywhere recovers to the last whole record; the real program, killed repeatedly with `SIGKILL` in the middle of writes, ends with the journal of a run that was never killed |
+| Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input. On the journal: any cut gives a prefix of the requests, and any changed byte is noticed and never applied |
 | Sanitizers | AddressSanitizer and UBSan on all tests; ThreadSanitizer on all of them too, which is what checks the queues' memory ordering |
 | CI | all of the above on GCC and Clang, plus a formatting check |
 
@@ -320,6 +350,11 @@ number of connections and the CPUs each program was pinned to.
    never saw its quotes and did not react to them. It compares strategies
    under those assumptions and shows adverse selection; it does not estimate
    what a strategy would earn.
-9. Linux only, GCC and Clang only.
+9. The journal is not connected to the exchange. `engine_journal` shows an
+   engine recovering; `exchange_server` runs without a journal, because doing
+   it properly means holding every response until its request is on disk and
+   giving clients a way to learn what survived. One file on one disk: no
+   rotation and no second copy.
+10. Linux only, GCC and Clang only.
 
 This project is not affiliated with or endorsed by Nasdaq.

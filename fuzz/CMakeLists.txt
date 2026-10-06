@@ -11,3 +11,4 @@ function(obe_add_fuzzer name)
 endfunction()
 
 obe_add_fuzzer(parser_fuzz parser_fuzz.cpp)
+obe_add_fuzzer(journal_fuzz journal_fuzz.cpp)

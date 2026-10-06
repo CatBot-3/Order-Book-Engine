@@ -268,6 +268,10 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Simulator scenario | `tests/sim/sim_scenario_test.cpp` | each rule of the fill model on hand-built messages: who is ahead, the three ways a quote trades, refusals, halts, latency, every money figure |
 | Simulator property | `tests/sim/sim_property_test.cpp` | over generated markets, after every message: the queue ahead against the test's own copy of the orders, the money recounted from the fills, the book against a plain replay |
 | Strategies | `tests/sim/strategy_test.cpp`, `avellaneda_stoikov_test.cpp` | tick rounding, the simple strategies and the volatility estimate against figures worked out by hand; the hand-written strategy against its contract |
+| Journal format | `tests/journal/journal_format_test.cpp`, `fuzz/journal_fuzz.cpp` | record bytes built by hand; truncation at every byte, every single-bit error, and the line between a torn tail and corruption |
+| Recovery | `tests/journal/recovery_test.cpp` | an engine rebuilt from a journal holds, said and goes on to say exactly what the original did; stopping short anywhere gives the engine as it was then; group commit loses only the unfinished batch |
+| Snapshot | `tests/journal/snapshot_test.cpp` | restore then compare as above; each thing a snapshot could forget; damaged and implausible snapshots refused |
+| Recovery from files | `tests/journal/journal_file_test.cpp`, `scripts/journal_crash_test.sh` | a torn tail cut and carried on in the same file; the real program killed repeatedly ends with the journal of a run that never was |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
 orders that recomputes the best bid and offer by scanning every order after
@@ -301,6 +305,8 @@ bodies are left out until they are written.
 | Gateway, market-data publisher and receiver, load generator | `include/obe/net/`, `apps/` | written |
 | Market-making simulator, fill model, simple strategies, volatility estimate | `include/obe/sim/` | written |
 | Avellaneda-Stoikov strategy | `include/obe/sim/avellaneda_stoikov.hpp` | **to write** |
+| Journal, replay, snapshot, recovery from files | `include/obe/journal/` | written |
+| Snapshot support for the hand-written engine | the five `Restorable` functions, in `include/obe/engine/matching_engine.hpp` | optional: see below |
 
 Each "to write" header holds the interface, the questions to settle and where
 the measurements that settle them come from. Their tests are built into
@@ -319,6 +325,17 @@ ctest --preset debug -L needs-your-code      # the hand-written parts
 Until a container is written its tests fail with a message naming the missing
 function, and `--impl <name>` in the apps exits with status 4. Record the
 decisions you make for each one in sections 6.3 onwards.
+
+The hand-written engine is journaled and recovered by replay as soon as it
+matches: `obe_hand_written_journal_tests` and the second crash test run on it
+under the same label. Saving it to a snapshot is a further step and nothing
+waits on it. It means adding the five functions listed under "Restoring" in
+`engine/concepts.hpp`, then pointing the `Impl` alias at the top of
+`tests/journal/snapshot_test.cpp` at it, which runs that whole suite on the
+new engine. The question worth settling first: when
+orders are restored one at a time into intrusive queues of pooled nodes, what
+has to be true of the pool and the index afterwards for the engine to be
+indistinguishable from one that got there by trading?
 
 ### 6.1 Reference order store
 
@@ -1066,7 +1083,258 @@ microsecond apart from contributing an enormous value on their own.
 None of this says anything about any strategy. The markets in the tests are
 generated, and their numbers mean nothing.
 
-## 12. Decisions that are open to change
+## 12. Journal and recovery (`include/obe/journal`)
+
+An engine that lives only in memory forgets every resting order the moment
+its process dies. This layer is what lets it be killed at any instant and come
+back holding exactly what it held. It is the first of the spec's stretch
+ideas.
+
+### 12.1 The idea: record what went in
+
+The matching engine reads no clock and makes no random choice. What it does
+is fixed by the requests it is given, their order, and the times they carry
+(section 8.1). So its state never has to be saved in order to survive. It is
+enough to save the requests. Give them again, in order, to a fresh engine, and
+it arrives where the old one was and says, on the way, exactly what the old
+one said.
+
+That is why the journal holds requests and nothing else: no trades, no book,
+no reports. Recording results as well would give two descriptions of the same
+history that could disagree, and nothing to say which to believe.
+
+Two things follow.
+
+1. **The request is written before the engine acts on it** ("write-ahead").
+   Had the engine acted first and the process died before the write, the
+   outside world could have seen a trade that no replay would ever produce
+   again.
+2. **Recovery costs as much as the history is long.** Replaying a day of
+   requests takes about as long as matching them did. A snapshot
+   (section 12.6) is the shortcut: the engine's state at one moment, and the
+   journal only from there.
+
+### 12.2 Shape
+
+| File | What it is |
+|---|---|
+| `records.hpp` | the four records, one per thing an engine can be asked: open an instrument, submit, cancel, replace. Field lists in the style of the feed messages, so the feed codec encodes them |
+| `writer.hpp` | `JournalWriter<Out>`: numbers the records, frames and checksums them into a buffer, and hands the buffer to `Out` on `flush()`. `Out` is a file in the programs and a vector in the tests |
+| `reader.hpp` | `JournalReader`: reads records back and classifies how the journal ends |
+| `replay.hpp` | `replay()`, which gives a journal to an engine; `Journaled<Engine, Writer>`, an engine wrapper that records each request and then passes it on; `state_digest()` |
+| `snapshot.hpp` | `capture`, `encode`, `decode`, `plausible`, `restore` |
+| `file.hpp` | `JournalFile` (append, `fdatasync`, cut), and `write_file_atomically` for snapshots |
+| `recover.hpp` | `recover()`: snapshot if sound, then the journal, then cut a torn tail |
+
+`Journaled` has the engine's own interface, so anything that drives an engine
+can drive a journaled one instead, and the engine underneath does not know.
+Replay goes through the engine's ordinary operations, so it needs nothing from
+an engine beyond the contract of section 8: the hand-written engine can be
+journaled and recovered as it is.
+
+### 12.3 The file
+
+```
+file header   16 bytes   "OBEJ", version (u16), zero (u16), number of the first record (u64)
+record        14 bytes   crc (u32)   CRC-32 of everything after this field
+                         size (u16)  bytes in the body
+                         seq (u64)   one more than the record before
+              size bytes body: a type byte, then that record's fields
+```
+
+Integers are big-endian, like every other format here. A submit is 34 bytes
+of body, so a request costs 48 bytes on disk.
+
+Why each field is there:
+
+1. **The checksum** lets a reader tell a whole record from one that was being
+   written when the machine stopped. A cut-off record is the ordinary way for
+   a journal to end, so this is not error handling at the edge of the design;
+   it is the centre of it. CRC-32 finds every error confined to 32 consecutive
+   bits, which covers the usual damage: a missing tail, a zeroed block.
+2. **The sequence number** catches what a checksum cannot: a record that is
+   intact but missing, repeated, or from another file. It is also what joins a
+   journal to a snapshot and one journal file to the next: the file header
+   says which record the file starts with.
+3. **The size** makes the format readable by code that does not know every
+   record type, and lets the reader check a record's checksum before it
+   believes its type.
+4. **Fields are stored as given, valid or not.** A side byte that is neither
+   `B` nor `S` is a request the engine rejects, and the rejection is part of
+   what a replay has to reproduce. The journal does not tidy its input.
+
+### 12.4 How a journal ends
+
+| The reader finds | Called | Meaning | What recovery does |
+|---|---|---|---|
+| the end of the file, after a whole record | clean end | the writer finished a write | carries on |
+| a record it cannot read, and nothing readable after it | torn tail | the machine stopped during a write | cuts the file back to the last whole record and carries on |
+| a record it cannot read, and good records after it | corrupt | something damaged the middle of the file | stops and reports; changes nothing |
+| an intact record with the wrong number | bad sequence | records are missing, or two files were joined wrongly | stops and reports |
+| an intact record of a type it does not know | unknown record | written by a newer version | stops and reports |
+
+The second and third rows cannot be told apart by looking at the bad record:
+a damaged length field looks exactly like a record that runs off the end of
+the file. So after a failure the reader looks ahead for anything that parses
+as a later record, with a matching checksum and a number not yet reached, and
+decides by whether it finds one. The number is part of the test: after a
+crash a filesystem can leave old blocks showing at the end of a file that was
+being extended, and an intact record with a number already passed is that,
+not a good record beyond damage.
+
+The difference matters because the two call for opposite actions. A torn tail
+holds nothing that was ever complete, so cutting it loses nothing. After
+damage in the middle, the records beyond it are good and cannot be applied
+(the ones before them are missing), and cutting the file there would destroy
+them. That is a decision for a person, with the file intact in front of them.
+
+One case is beyond telling: damage inside the very last record looks like a
+torn tail and is treated as one. If that record had been synced and its
+result announced, cutting it loses an acknowledged request. Closing that gap
+takes a second copy of the journal somewhere else, which is replication and
+is not here (section 14).
+
+### 12.5 What "written" means
+
+`write()` returning does not put bytes on a disk. It gives them to the
+operating system, which writes them out when it gets round to it.
+`fdatasync()` returns only when the device reports them stored.
+
+| What fails | Written, not synced | Written and synced |
+|---|---|---|
+| the program crashes | survives | survives |
+| the operating system crashes, or the power goes | lost | survives |
+
+A sync is slow, on the order of a millisecond on a consumer SSD against about
+a microsecond for the write, so a journal that syncs after every request
+handles about a thousand requests a second. **Group commit** is the way out:
+gather the requests that arrived in one turn of the event loop, write them
+together, sync once, and only then let their results out. One sync is shared
+by the whole batch. Each request waits a little longer; the cost per request
+falls with the size of the batch.
+
+The rule that makes it safe is the last clause: **nothing may be said about a
+request that a crash could still erase.** `Journaled` takes a batch size and
+has `commit()`; holding the engine's output back until the commit is the
+caller's job, because only the caller knows where the output goes.
+
+`fdatasync` is used and not `fsync`: it stores the data and whatever metadata
+is needed to read it back (the file's length), and skips the rest (the
+modification time), which on some filesystems saves a second write.
+
+All of this assumes the device does what it says. Some drives acknowledge a
+flush they have not performed, and some virtual and network filesystems do
+not pass the flush on. `journal_bench` measures the device it is pointed at:
+a sync that takes microseconds is a sync that did not happen.
+
+### 12.6 Snapshots
+
+The test of a snapshot is that an engine restored from it cannot be told from
+the original by anything that happens afterwards. That takes more than the
+book:
+
+| In the snapshot | Why |
+|---|---|
+| the open instruments and their symbols | |
+| every resting order: id, owner, token, side, price, open shares | |
+| the orders of each level listed oldest first | time priority is not a field of an order; it is the order's place in a queue |
+| the last order id and the last match number | they are in no order and no level, and without them the restored engine would give its next order an id that is already resting |
+| the running totals | so they carry on instead of restarting |
+| the number of the first journal record it does not include | where to pick the journal up |
+
+Level totals, best prices and the index from id to order are left out: they
+can be worked out, and what can be worked out cannot be wrong.
+
+A snapshot file is checked whole (length against the counts inside it, then a
+CRC over all of it) and then the state is checked for sense (`plausible`:
+every order belongs to a listed instrument, no id twice or beyond the counter,
+no book crossed) before any of it reaches an engine. Unlike a journal, half a
+snapshot is worth nothing.
+
+It is written with `write_file_atomically`: to a temporary name, synced,
+renamed over the real name, and the directory synced. A crash at any point
+leaves the old snapshot or the new one, never a mixture.
+
+Two rules hold the pair together.
+
+1. **The journal is made durable before the snapshot is written.** A snapshot
+   says "I include everything before record N". If it reached the disk and the
+   journal's records before N did not, the two would describe different
+   histories. `recover()` notices a journal that ends before its snapshot and
+   refuses to guess.
+2. **The journal is the record; a snapshot is a convenience.** A snapshot that
+   fails any check is ignored and recovery replays the journal from the
+   start.
+
+Loading state directly needs more from an engine than the contract of
+section 8. Those five functions are the `Restorable` concept in
+`engine/concepts.hpp`. The reference engine has them. They are optional: an
+engine without them is still journaled and recovered by replay.
+
+### 12.7 `engine_journal` and the crash test
+
+`engine_journal run` drives an engine with seeded flow through a journal. If
+the journal is already there it recovers first and carries on from the next
+request. `check` replays without changing anything and `dump` prints the
+records.
+
+`scripts/journal_crash_test.sh` holds it to one standard. A run is made that
+is never killed. Another is killed over and over and restarted with the same
+options until it finishes. Its journal must then be the same file, byte for
+byte. Anything recovery gets wrong (a request lost, applied twice, applied to
+the wrong state) changes what the engine does next, and with it every byte
+written afterwards.
+
+Killing a process from outside is not enough to test this. `kill -9` lands
+between two system calls, so the file always ends where some write ended, and
+the torn record that recovery exists for never appears. So the program tears
+its own write: `--kill-at-flush K --kill-keep PCT` writes only part of the
+K-th batch and then sends itself `SIGKILL`.
+
+The load generator in that program stands for the outside world, which does
+not crash when the engine does. To put it back where it was, a restarted run
+feeds it its own requests again from the first, against a second engine that
+is then thrown away. That costs as much as a full replay and is a cost of the
+demonstration, not of recovery; the two are timed and printed separately.
+
+### 12.8 How it is tested
+
+1. **The claim itself** (`tests/journal/recovery_test.cpp`, typed over the
+   engines). An engine rebuilt from a journal holds what the original held and
+   said, during the replay, every report and every market-data message the
+   original said. Then both are given the same further requests and must
+   answer identically, which is what shows the ids, the match numbers and the
+   queue positions came back right.
+2. **Every way of stopping short.** The journal is cut after each record, and
+   at chosen bytes around and inside every record; each time the engine must
+   be the one that existed after the last whole record. A journal cut, then
+   carried on, must equal one that was never cut.
+3. **Group commit** loses the unfinished batch and nothing else, and how often
+   the writer flushes does not change a byte of the file.
+4. **Snapshots** (`snapshot_test.cpp`): restore, then compare as in 1; a
+   snapshot plus the journal after it; each thing a snapshot could forget
+   (queue order, the counters) has a test that fails without it; every
+   truncation and every single-bit error of a snapshot file is refused.
+5. **The files** (`journal_file_test.cpp`): recovery from a real directory,
+   including a torn tail cut and carried on, a damaged snapshot passed over,
+   and a journal that ends before its snapshot.
+6. **The reader against damage** (`journal_format_test.cpp`): truncation at
+   every byte, every single-bit error, trailing zeros, and the line between a
+   torn tail and corruption.
+7. **`fuzz/journal_fuzz.cpp`**: on arbitrary bytes, the part of a journal the
+   reader vouches for is itself a clean journal; on journals built from the
+   input, any cut gives a prefix and any changed byte is noticed and never
+   applied.
+8. **The crash test** above, on the real program.
+
+What none of this shows is that a sync reached the disk. The tests count the
+calls to `fdatasync` and check they are made in the right places; whether the
+bytes survive a power cut can only be shown by cutting the power, or with a
+block device that can be told to drop unsynced writes (dm-flakey and the
+like). Take the calls out and every test here still passes. That is a known
+gap, and the reason section 12.5 says what the code relies on the device for.
+
+## 13. Decisions that are open to change
 
 These were made along the way to get each phase standing. Each is cheap to
 revisit.
@@ -1129,8 +1397,26 @@ revisit.
 14. **A partly filled quote is not topped up.** While its price is still the
     one wanted it stays as it is, with what is left of it. Adding size would
     mean a new order at the back of the queue.
+15. **The journal records requests, not results.** It is the smaller of the
+    two and cannot disagree with itself (section 12.1). The price is that the
+    journal is only as good as the engine is deterministic: a change to the
+    matching rules changes what an old journal replays to, so a journal
+    belongs to the version of the engine that wrote it.
+16. **Journaling is a wrapper, not part of the engine.** `Journaled` has the
+    engine's interface and the engine does not know it is there. Any engine
+    can be journaled, and the engine's hot path carries no branch for it.
+17. **CRC-32, computed with a table.** The same polynomial as zlib and
+    Ethernet, a byte at a time. CRC-32C with the processor's own instruction
+    is several times faster and is the obvious experiment if the "journal,
+    discarded" row of `journal_bench` shows the checksum mattering.
+18. **A torn tail is cut without asking; damage in the middle never is.**
+    Section 12.4 gives the reason for each half.
+19. **Restoring from a snapshot is an optional capability.** The five
+    functions are a separate concept and not part of the engine contract, so
+    that an engine is not required to expose its insides in order to be
+    usable.
 
-## 13. Known limits
+## 14. Known limits
 
 1. Linux only: `mmap`, `epoll`, `perf_event_open`.
 2. GCC and Clang only: `__builtin_bswap*` and, in the benchmarks, `rdtsc`.
@@ -1146,3 +1432,18 @@ revisit.
    knows nothing of hidden orders, fees beyond a flat rebate, or the reaction
    of other participants to its quotes (section 11.3). Its output compares
    strategies; it does not predict what one would earn.
+8. The journal is not connected to the exchange. `exchange_server` runs its
+   engine without one. Doing it properly needs two things that are not here:
+   the gateway has to hold every response and every market-data packet until
+   the batch containing its request is durable, and clients need a session
+   layer (limit 5) to learn, after reconnecting, which of their requests
+   survived.
+9. One journal file that grows without end. The format lets a file start at
+   any record and the tests replay a journal kept in several files, but
+   nothing starts a new file or deletes the ones a snapshot has made
+   unnecessary.
+10. One disk on one machine. A journal protects against the process and the
+    machine stopping, not against the disk dying: that takes a second copy
+    somewhere else, written before a request is acknowledged.
+11. Snapshots work for the reference engine only, until the hand-written
+    engine is given the five `Restorable` functions.

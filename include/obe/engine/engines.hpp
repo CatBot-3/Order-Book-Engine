@@ -33,6 +33,7 @@ struct PooledEngineImpl {
 
 static_assert(EngineLike<ReferenceEngine<NullReports, NullMarketData>>);
 static_assert(EngineLike<MatchingEngine<NullReports, NullMarketData>>);
+static_assert(Restorable<ReferenceEngine<NullReports, NullMarketData>>);
 
 // Calls f(std::type_identity<Impl>{}) once for every engine, the reference
 // first.

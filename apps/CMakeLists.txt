@@ -19,3 +19,7 @@ obe_add_app(md_listen md_listen.cpp)
 
 # The market-making simulator (phase 8): a replay with simulated quotes.
 obe_add_app(mm_sim mm_sim.cpp)
+
+# The journal (stretch idea 1): an engine that records its requests, and
+# recovers from the record after being killed.
+obe_add_app(engine_journal engine_journal.cpp)

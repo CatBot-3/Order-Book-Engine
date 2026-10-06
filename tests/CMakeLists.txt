@@ -97,6 +97,19 @@ obe_add_test(
 obe_add_test(obe_hand_written_sim_tests LABELS needs-your-code SOURCES
              sim/avellaneda_stoikov_test.cpp)
 
+# The journal (stretch idea 1): the file format and its reader, recovery by
+# replay, snapshots, and the file layer. Recovery by replay needs nothing from
+# an engine but the ordinary contract, so that suite is typed over the engines
+# and built a second time for the hand-written one.
+obe_add_test(
+  obe_journal_tests
+  LABELS unit
+  SOURCES journal/journal_format_test.cpp journal/recovery_test.cpp journal/snapshot_test.cpp
+          journal/journal_file_test.cpp)
+obe_add_test(obe_hand_written_journal_tests LABELS needs-your-code SOURCES
+             journal/recovery_test.cpp)
+target_compile_definitions(obe_hand_written_journal_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+
 # The integration tests below are shell scripts. They are run through bash
 # explicitly so they work on a checkout that lost its executable bits, which is
 # what a repository kept on a Windows drive and built from WSL tends to be.
@@ -305,4 +318,26 @@ if(Python3_Interpreter_FOUND AND OBE_BUILD_APPS AND OBE_BASH)
       $<TARGET_FILE:mm_sim> "${CMAKE_CURRENT_BINARY_DIR}/mm_sim_as_smoke" --strategy as
       --max-tau 1)
   set_tests_properties(mm_sim_avellaneda_stoikov_smoke PROPERTIES LABELS "needs-your-code")
+endif()
+
+# The journal through the real program: an engine that is killed with SIGKILL
+# in the middle of its writes, again and again, must end with the journal a
+# run that was never killed writes, byte for byte. The second test is the same
+# on the hand-written engine, which recovers by replay like any other.
+if(OBE_BUILD_APPS AND OBE_BASH)
+  add_test(
+    NAME journal_crash_test
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/journal_crash_test.sh"
+      $<TARGET_FILE:engine_journal> "${CMAKE_CURRENT_BINARY_DIR}/journal_crash_test")
+  set_tests_properties(journal_crash_test PROPERTIES LABELS "integration")
+
+  add_test(
+    NAME journal_crash_test_hand_written_engine
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/journal_crash_test.sh"
+      $<TARGET_FILE:engine_journal> "${CMAKE_CURRENT_BINARY_DIR}/journal_crash_test_pooled"
+      20261006 pooled)
+  set_tests_properties(journal_crash_test_hand_written_engine PROPERTIES LABELS
+                                                                          "needs-your-code")
 endif()

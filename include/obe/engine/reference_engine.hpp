@@ -235,6 +235,40 @@ class ReferenceEngine {
     [[nodiscard]] bool listed(Locate locate) const noexcept { return books_[locate].listed; }
     [[nodiscard]] const EngineStats& stats() const noexcept { return stats_; }
 
+    // --- Restoring (see "Restoring" in concepts.hpp) --------------------------
+
+    [[nodiscard]] feed::Symbol symbol(Locate locate) const noexcept {
+        return books_[locate].symbol;
+    }
+    [[nodiscard]] EngineCounters counters() const noexcept { return {last_id_, last_match_}; }
+
+    bool restore_instrument(Locate locate, const feed::Symbol& symbol) {
+        Book& book = books_[locate];
+        if (book.listed) {
+            return false;
+        }
+        book.listed = true;
+        book.symbol = symbol;
+        return true;
+    }
+
+    bool restore_order(Locate locate, Side side, const RestingOrder& order) {
+        Book& book = books_[locate];
+        if (!book.listed || !valid_side(side) || order.qty == 0 || order.price == 0 ||
+            index_.contains(order.id)) {
+            return false;
+        }
+        rest(book, Incoming{order.id, order.owner, order.token, locate, side}, order.price,
+             order.qty);
+        return true;
+    }
+
+    void restore_counters(const EngineCounters& counters, const EngineStats& stats) noexcept {
+        last_id_ = counters.last_order_id;
+        last_match_ = counters.last_match_number;
+        stats_ = stats;
+    }
+
  private:
     struct Resting {
         OrderId id;

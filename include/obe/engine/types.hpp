@@ -178,4 +178,14 @@ struct EngineStats {
     friend bool operator==(const EngineStats&, const EngineStats&) = default;
 };
 
+// The two numbers an engine hands out as it goes. They are not visible in the
+// book, and an engine restored from a snapshot must carry on from them: an
+// order id or a match number given out twice would name two different things.
+struct EngineCounters {
+    OrderId last_order_id = 0;            // the id the most recent order got
+    std::uint64_t last_match_number = 0;  // the number the most recent trade got
+
+    friend bool operator==(const EngineCounters&, const EngineCounters&) = default;
+};
+
 }  // namespace obe::engine
