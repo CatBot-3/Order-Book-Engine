@@ -265,6 +265,9 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Gateway | `tests/net/gateway_test.cpp` | partial reads, mid-message disconnects, bad input, slow clients, clients that pause and resume, connection limits and identities, over real loopback sockets |
 | Load measurement | `tests/net/open_loop_test.cpp` | due times neither drift nor overflow; a stall is charged to every request due during it, shown against a send-and-wait generator in simulated time |
 | The three programs | `scripts/gateway_smoke.sh` | orders in over TCP, market data out over UDP, the subscriber's book consistent and gap-free |
+| Simulator scenario | `tests/sim/sim_scenario_test.cpp` | each rule of the fill model on hand-built messages: who is ahead, the three ways a quote trades, refusals, halts, latency, every money figure |
+| Simulator property | `tests/sim/sim_property_test.cpp` | over generated markets, after every message: the queue ahead against the test's own copy of the orders, the money recounted from the fills, the book against a plain replay |
+| Strategies | `tests/sim/strategy_test.cpp`, `avellaneda_stoikov_test.cpp` | tick rounding, the simple strategies and the volatility estimate against figures worked out by hand; the hand-written strategy against its contract |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
 orders that recomputes the best bid and offer by scanning every order after
@@ -296,13 +299,17 @@ bodies are left out until they are written.
 | Mutex queue, spin channel, seqlock, pipeline | `include/obe/util/mutex_queue.hpp`, `spin_channel.hpp`, `seqlock.hpp`, `include/obe/pipeline/` | written |
 | Lock-free ring | `include/obe/util/spsc_ring.hpp` | **to write** |
 | Gateway, market-data publisher and receiver, load generator | `include/obe/net/`, `apps/` | written |
+| Market-making simulator, fill model, simple strategies, volatility estimate | `include/obe/sim/` | written |
+| Avellaneda-Stoikov strategy | `include/obe/sim/avellaneda_stoikov.hpp` | **to write** |
 
 Each "to write" header holds the interface, the questions to settle and where
 the measurements that settle them come from. Their tests are built into
 second executables (`obe_hand_written_tests` for the containers,
 `obe_hand_written_engine_tests` for the engine,
 `obe_hand_written_concurrency_tests` for the ring) from the same sources as the
-reference tests, and carry the `ctest` label `needs-your-code`:
+reference tests, and carry the `ctest` label `needs-your-code`. The strategy
+has an executable of its own, `obe_hand_written_sim_tests`, under the same
+label:
 
 ```sh
 ctest --preset debug -LE needs-your-code     # everything that is finished
@@ -366,6 +373,17 @@ what the baseline measures and what phase 4 replaces one at a time.
 ### 6.7 Lock-free ring
 
 *(yours)*
+
+### 6.8 Avellaneda-Stoikov strategy
+
+*(yours)*
+
+The spec's list of parts to write by hand names the order store, the price
+levels, the queue and the matching loop. This one is not on it. It is left to
+write for the same reason those are: it is the part of the simulator that
+carries the idea, it is about twenty lines, and a strategy that cannot be
+derived at a whiteboard is not one to put a name to. Everything else in the
+simulator runs without it.
 
 ## 7. Phase 4 structure
 
@@ -863,9 +881,195 @@ compete for the same cores.
    entry): every request acknowledged, the subscriber sees the whole feed with
    no gap and rebuilds a consistent book, the server shuts down cleanly.
 
-## 11. Decisions that are open to change
+## 11. Market-making simulator (`include/obe/sim`)
 
-These were made to get phases 1 to 3 standing. Each is cheap to revisit.
+**This is a simulation with stated assumptions, not evidence of
+profitability.** It replays a recorded feed and asks what would have happened
+to quotes that were never in the market. The recorded market did not see them
+and did not react to them. What it is good for is comparing strategies under
+the same assumptions, and seeing adverse selection in numbers.
+
+The spec keeps this phase out of the core, and so does the code: everything is
+in `include/obe/sim/`, `apps/mm_sim.cpp` and `tests/sim/`, and nothing in
+sections 2 to 10 includes any of it.
+
+### 11.1 Shape
+
+```
+ ITCH file ──> parser ──> MarketMakingSim ──────────────> BookManager (unchanged)
+                            │  for the quoted security, looks at each
+                            │  message before the book applies it
+                            ├──> fill model: queue position, fills
+                            ├──> strategy: "what do you want resting?"
+                            └──> report: fills, position, money, markouts
+```
+
+`MarketMakingSim` is an ITCH handler, like `BookManager`, and contains one.
+Every message goes on to the real book unchanged; a strategy that never quotes
+gives exactly a plain replay, and a test holds it to that. For the one quoted
+security the simulator looks at each message first, while the order the
+message names is still as it was.
+
+### 11.2 The fill model
+
+A simulated quote rests at a price, behind everything displayed at that price
+when it joined.
+
+The spec's outline says the position of a cancel in the queue is unknown and
+that an assumption is needed. That is true of a feed that publishes level
+totals. ITCH publishes every order, and names the order in every execution,
+cancel and delete. So for each real order at our price it is known whether it
+arrived before our quote (ahead) or after (behind): the simulator numbers the
+real orders of the security in arrival order and remembers the number that was
+current when the quote joined. No assumption is needed for displayed orders.
+
+From that, a quote moves up the queue one way and trades three ways:
+
+| What the feed shows | What it means for our quote | Why |
+|---|---|---|
+| An order **ahead** of us is executed, cancelled or deleted | the queue in front is shorter | it was in front, and it has gone |
+| An order **behind** us at our price is executed | we traded, for up to as many shares | priority at a price is by time: whoever traded with it met us first |
+| An order at a **worse** price on our side is executed | we traded, for up to as many shares | priority is by price first: the trade went past ours to reach it |
+| Our quote is better than every real one on its side, and an order **arrives** on the other side at a price that reaches ours | we traded, for up to its size | in the recorded market it rested; with our quote there it would have met it |
+
+A replaced order is an order leaving and a new one arriving at the back, which
+is how the exchange treats it. A fill is always at the quote's own price.
+
+The fourth row has a condition worth spelling out. If a real order on our side
+is at least as good as ours and the arriving order rested anyway, the recorded
+book is locked or crossed, the arrival did not trade with the real order, and
+nothing can be concluded about ours. That happens outside continuous trading
+and in malformed feeds, and the simulator then does nothing.
+
+### 11.3 What is assumed
+
+Each assumption either flatters the result or hurts it, and it is worth knowing
+which.
+
+| | Assumption | Effect |
+|---|---|---|
+| a | **No market impact.** The recorded orders arrive exactly as they did. A real quote changes what others do. And the shares that "would have traded with us first" still trade with the recorded order too, so that liquidity is counted twice | flatters |
+| b | **No hidden orders.** Executions against non-displayed orders (`P` messages) do not fill us and do not move the queue. A hidden order at a better price would have been ahead of us | mixed |
+| c | **Queue position is exact** for displayed orders (section 11.2) | neither |
+| d | **One fixed latency** for new quotes and for cancels. Real latency varies and is worst when the market is busiest, which is when it matters | flatters |
+| e | **One change in flight per side.** While a cancel or a new quote is on its way, further wishes for that side wait until it has landed | hurts slightly |
+| f | **Quotes are passive.** One that would trade on arrival is refused, never executed as a taker | neither |
+
+Fees are not modelled beyond one number: a rebate (or fee, if negative) per
+share filled. It is zero unless given. An exchange's fee schedule is an input,
+not something this project knows.
+
+### 11.4 Time
+
+A strategy states what it wants; the simulator turns the difference from what
+is resting into a cancel, a new quote or both, and each takes effect one
+latency later. Until then a cancelled quote can still be hit, and a new one is
+not in the queue. A new quote joins behind whatever is at its price when it
+arrives, not when it was decided.
+
+Changes are carried out in the order they would reach the exchange: by time,
+and at the same time cancels before new quotes. The second rule is what lets a
+strategy move both quotes up together: the new bid may go where the old ask
+was, because the old ask has gone by the time it arrives.
+
+The simulator only does anything when a message for the quoted security
+arrives, and that is exact, not an approximation. Between two messages of a
+security its book does not change. So a quote that was due to arrive between
+them joins the same queue, and a markout due between them reads the same mid,
+whether it is handled at its own time or at the next message.
+
+The end of the quoting window is the one event known in advance, so no latency
+applies to it: quotes are out by then.
+
+### 11.5 Money
+
+Money is kept in integers, like prices everywhere else. The mid of 10.00 and
+10.01 is 10.005, which is not a whole price unit, so the mid is kept doubled
+(bid + ask), and so is every figure measured against it.
+
+Three figures describe the result, and they are tied by an identity:
+
+```
+profit, with the remaining position valued at the last mid
+    =  earned at the moment of each fill       sum of shares x (mid - price) for buys,
+                                                              (price - mid) for sells
+    +  from holding the position afterwards     sum over moves of the mid of position x move
+    +  rebates
+```
+
+It holds exactly, not approximately. A fill changes the profit by exactly its
+distance from the mid, and a move of the mid changes it by exactly the position
+times the move, and nothing else changes it. The simulator checks it after
+every message in the tests and `mm_sim` refuses to report a clean result if it
+fails.
+
+**Markout** is the same measurement as "earned at the fill", taken later: the
+distance of the fill price from the mid one second and ten seconds afterwards.
+The first figure is what quoting away from the mid earns; the difference
+between it and the markout is what it costs to be filled just before the price
+moves against the fill. That cost has a name, adverse selection, and it is not
+an accident of this simulator. Look at the ways a quote trades in section 11.2:
+a bid is filled when a seller has taken everything ahead of it at its price, or
+has traded through its price. Both are what a falling market looks like. A
+quote is filled disproportionately when it is about to be wrong.
+
+### 11.6 Strategies
+
+A strategy is one function: given the real best bid and offer, the position
+and the time, what do you want resting on each side? It is resolved at compile
+time, like the feed handler. Three are written:
+
+| Strategy | What it does | What it is for |
+|---|---|---|
+| `NoQuotes` | nothing | checking that the simulator leaves the replay alone |
+| `JoinBest` | joins the real best bid and offer at the back of the queue | the strategy that depends most on the queue model |
+| `FixedSpread` | quotes a fixed distance either side of the mid | the baseline to compare others with |
+
+Both stop adding to a position at a limit, and know nothing else about risk.
+
+**Avellaneda-Stoikov** (`avellaneda_stoikov.hpp`) is the textbook step up: it
+moves both quotes against the position and widens them with volatility and with
+the time left. It is left to be written by hand; its header has the contract,
+the questions to be able to answer, and a test suite whose expected prices are
+worked out by hand in the comments.
+
+`EwmaVariance` (`volatility.hpp`) supplies the volatility it needs. The mid is
+observed at irregular times, so the estimate is the sum of squared moves
+divided by the sum of the time they took, both faded with age. Dividing the
+sums, and not averaging the ratio move by move, is what stops two changes a
+microsecond apart from contributing an enormous value on their own.
+
+### 11.7 How it is tested
+
+1. **The fill model, one rule at a time** (`sim_scenario_test.cpp`): a small
+   real book built by hand, a strategy that quotes what the test tells it to,
+   and real orders played around the quote. Every row of the table in 11.2,
+   every refusal, halts, the quoting window, latency, and the arithmetic of
+   every money figure.
+2. **Whole markets** (`sim_property_test.cpp`): the feed a matching engine
+   published under seeded random flow, checked after every message. The test
+   keeps its own copy of the security's orders, knowing nothing about queues.
+   When a quote joins, it notes which orders are at that price; from then on
+   the simulator's "shares ahead" must equal what is left of exactly those
+   orders. That checks who is counted as ahead and who as behind, which is the
+   part of the model that cannot be checked by arithmetic.
+3. **The money, recounted** from the list of fills alone, and the identity of
+   section 11.5 after every message.
+4. **The book inside the simulator** against a plain replay of the same bytes.
+5. **That the runs reach every case**: every kind of fill and refusal occurs
+   across the seeds, or the properties above would be vacuous.
+6. **The strategies and the estimator** against figures worked out by hand.
+7. **The programs** (`scripts/mm_sim_smoke.sh`): `flow_gen` writes a market,
+   `mm_sim` runs over it; a strategy that never quotes makes nothing, the same
+   run twice writes the same report, a missing symbol is an error.
+
+None of this says anything about any strategy. The markets in the tests are
+generated, and their numbers mean nothing.
+
+## 12. Decisions that are open to change
+
+These were made along the way to get each phase standing. Each is cheap to
+revisit.
 
 1. **`AddOrder` covers both `A` and `F`.** One struct with an `attributed`
    flag, one `on_add` callback. The alternative is two structs and two
@@ -908,8 +1112,25 @@ These were made to get phases 1 to 3 standing. Each is cheap to revisit.
     is never reached; on one without, it is what keeps the run from stalling.
     A latency-critical deployment would spin without limit and reserve the
     cores.
+11. **The simulator lives in this repository.** The spec leaves open whether
+    phase 8 belongs here or in a project of its own. It is here, in three
+    directories that nothing else depends on (`include/obe/sim/`,
+    `apps/mm_sim.cpp`, `tests/sim/`), so that moving it out is a matter of
+    moving those directories and their entries in the build files.
+12. **Queue position by order reference.** The spec's outline tracks the
+    shares ahead of a quote and assumes where cancels fall. The feed names
+    every order, so the simulator tracks which orders are ahead instead, and
+    needs no assumption for displayed orders (section 11.2).
+13. **A strategy states what it wants; it does not send orders.** The
+    simulator works out the cancels and new quotes, and keeps a quote whose
+    price has not changed where it is in the queue. The alternative, a
+    strategy that sends and cancels orders itself, is closer to a real system
+    and makes every strategy repeat the same bookkeeping.
+14. **A partly filled quote is not topped up.** While its price is still the
+    one wanted it stays as it is, with what is left of it. Adding size would
+    mean a new order at the back of the queue.
 
-## 12. Known limits
+## 13. Known limits
 
 1. Linux only: `mmap`, `epoll`, `perf_event_open`.
 2. GCC and Clang only: `__builtin_bswap*` and, in the benchmarks, `rdtsc`.
@@ -921,3 +1142,7 @@ These were made to get phases 1 to 3 standing. Each is cheap to revisit.
    lab network, not for anything exposed.
 6. The exchange is one thread. Its throughput is that of one core, and a slow
    stretch anywhere in the loop delays every client.
+7. The simulator quotes one security per run, with one quote per side, and
+   knows nothing of hidden orders, fees beyond a flat rebate, or the reaction
+   of other participants to its quotes (section 11.3). Its output compares
+   strategies; it does not predict what one would earn.

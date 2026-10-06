@@ -87,6 +87,16 @@ obe_add_test(
   SOURCES net/protocol_test.cpp net/moldudp_test.cpp net/udp_test.cpp net/gateway_test.cpp
           net/open_loop_test.cpp)
 
+# The market-making simulator: the fill model on hand-built messages, its
+# accounting over generated flow, and the strategies. The Avellaneda-Stoikov
+# strategy is written by hand and has its own executable.
+obe_add_test(
+  obe_sim_tests
+  LABELS unit
+  SOURCES sim/sim_scenario_test.cpp sim/sim_property_test.cpp sim/strategy_test.cpp)
+obe_add_test(obe_hand_written_sim_tests LABELS needs-your-code SOURCES
+             sim/avellaneda_stoikov_test.cpp)
+
 # The integration tests below are shell scripts. They are run through bash
 # explicitly so they work on a checkout that lost its executable bits, which is
 # what a repository kept on a Windows drive and built from WSL tends to be.
@@ -273,4 +283,26 @@ if(OBE_BUILD_APPS AND OBE_BASH)
       "${CMAKE_CURRENT_BINARY_DIR}" --engine pooled)
   set_tests_properties(hand_written_engine_gateway_smoke PROPERTIES LABELS "needs-your-code"
                                                                     RUN_SERIAL TRUE)
+endif()
+
+# The market-making simulator through the real programs, on a generated
+# market. Each run has its own directory: both write the same file names.
+if(Python3_Interpreter_FOUND AND OBE_BUILD_APPS AND OBE_BASH)
+  add_test(
+    NAME mm_sim_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/mm_sim_smoke.sh" $<TARGET_FILE:flow_gen>
+      $<TARGET_FILE:mm_sim> "${CMAKE_CURRENT_BINARY_DIR}/mm_sim_smoke")
+  set_tests_properties(mm_sim_smoke PROPERTIES LABELS "integration")
+
+  # The generated market moves as far in a few seconds as a real one does in a
+  # day. With the default horizon of a whole session the formula would keep
+  # the quotes out of reach of every trade, so the horizon is one second here.
+  add_test(
+    NAME mm_sim_avellaneda_stoikov_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/mm_sim_smoke.sh" $<TARGET_FILE:flow_gen>
+      $<TARGET_FILE:mm_sim> "${CMAKE_CURRENT_BINARY_DIR}/mm_sim_as_smoke" --strategy as
+      --max-tau 1)
+  set_tests_properties(mm_sim_avellaneda_stoikov_smoke PROPERTIES LABELS "needs-your-code")
 endif()

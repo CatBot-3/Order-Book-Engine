@@ -16,3 +16,6 @@ obe_add_app(flow_gen flow_gen.cpp)
 obe_add_app(exchange_server exchange_server.cpp)
 obe_add_app(load_gen load_gen.cpp)
 obe_add_app(md_listen md_listen.cpp)
+
+# The market-making simulator (phase 8): a replay with simulated quotes.
+obe_add_app(mm_sim mm_sim.cpp)

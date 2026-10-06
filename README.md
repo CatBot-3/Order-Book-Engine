@@ -5,7 +5,9 @@ Nasdaq's TotalView-ITCH 5.0 binary feed and rebuilds the displayed order book
 of every listed stock, with a correctness check on every book and a
 reproducible latency harness around the whole thing. It is growing into a small
 exchange: a price-time-priority matching engine, a lock-free hand-off between
-threads, a TCP order gateway and a UDP market-data feed.
+threads, a TCP order gateway and a UDP market-data feed. A market-making
+simulator replays the feed and asks what would have happened to quotes placed
+in it.
 
 The rule of the project: prove the book is right, measure before optimizing,
 and log every experiment with a before and an after, including the ones that
@@ -23,6 +25,7 @@ did not help.
 | 5 | Matching engine and flow generator | reference engine, flow generator, round trip and tests done; the pooled engine is being written |
 | 6 | Lock-free queue and threaded pipeline | mutex queue, seqlock, three-thread pipeline, benchmarks and tests done; the lock-free ring is being written; nothing measured yet |
 | 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; nothing measured yet |
+| 8 | Market-making simulator | fill model, metrics, two simple strategies and `mm_sim` done; the Avellaneda-Stoikov strategy is being written; not yet run on a real file |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -46,6 +49,9 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 
  as an exchange:    clients ──TCP──> [net] epoll gateway ──> [engine]
                     subscribers <──UDP── [net] MoldUDP64-style packets <── market data
+
+ as a simulation:   file ──> [feed] ──> [sim] fill model + strategy ──> [book]
+                                          └──> fills, position, profit, markouts
 ```
 
 | Directory | Contents |
@@ -55,9 +61,10 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 | `include/obe/engine/` | the matching-engine contract, `ReferenceEngine`, the hand-written `MatchingEngine`, `ItchFeedWriter`, the round-trip comparison |
 | `include/obe/pipeline/` | the replay as three threads joined by queues; the top-of-book board |
 | `include/obe/net/` | the order-entry protocol, `OrderGateway` on epoll, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
+| `include/obe/sim/` | the market-making simulator: fill model, the simple strategies, the hand-written Avellaneda-Stoikov strategy, volatility estimate, report |
 | `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock` |
 | `include/obe/gen/` | seeded generators: order flow for the engine, and a raw ITCH stream for fixtures |
-| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen` |
+| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen`; `mm_sim` |
 | `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `micro_bench` (Google Benchmark) |
 | `tests/`, `fuzz/` | unit, scenario, golden, differential, property and round-trip tests; libFuzzer target |
 | `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, latency curve, PGO build |
@@ -208,6 +215,21 @@ F=data/01302019.NASDAQ_ITCH50
    scripts/latency_curve.py results/load.json --plot results/latency_curve.png
    ```
 
+10. **The market-making simulation.** Replay a day and simulate quoting one
+    stock. `--from` and `--to` keep the quotes inside continuous trading;
+    `--latency-us` is the time between a decision and its effect.
+
+    ```sh
+    $B/apps/mm_sim $F --symbol AAPL --strategy fixed --half-spread 1 \
+        --from 09:30 --to 16:00 --latency-us 50 --json results/mm_fixed.json
+    $B/apps/mm_sim $F --symbol AAPL --strategy join --from 09:30 --to 16:00
+    $B/apps/mm_sim $F --symbol AAPL --strategy as --gamma 0.001 --k 200 \
+        --from 09:30 --to 16:00
+    ```
+
+    The report ends with the assumptions it rests on. Read them before reading
+    the profit line.
+
 ## Matching rules
 
 These are design choices, stated here so nobody has to infer them from the
@@ -270,6 +292,7 @@ number of connections and the CPUs each program was pinned to.
 | Round trip | the engine's published feed, through the feed handler, rebuilds the engine's book |
 | Concurrency | each queue: every item once, in order, intact, between two threads; the pipeline against the single-threaded replay; the seqlock against torn reads |
 | Network | the gateway over real loopback sockets: partial reads, mid-message disconnects, bad input, slow and paused clients; the feed with packets lost, repeated and reordered; the load generator's schedule against a server that stalls, in simulated time |
+| Simulation | each rule of the fill model on hand-built messages; over generated markets, the queue ahead of every quote against the test's own copy of the orders, and the profit recounted from the fills |
 | Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input |
 | Sanitizers | AddressSanitizer and UBSan on all tests; ThreadSanitizer on all of them too, which is what checks the queues' memory ordering |
 | CI | all of the above on GCC and Clang, plus a formatting check |
@@ -292,7 +315,11 @@ number of connections and the CPUs each program was pinned to.
 7. The matching engine is exercised with synthetic order flow: random orders
    around a random-walk mid price. It checks the engine and compares one build
    with another. It is not a model of a market.
-8. Not a trading strategy, and no claim about profit.
+8. Not a trading strategy, and no claim about profit. The market-making
+   simulator is a simulation with stated assumptions: the recorded market
+   never saw its quotes and did not react to them. It compares strategies
+   under those assumptions and shows adverse selection; it does not estimate
+   what a strategy would earn.
 9. Linux only, GCC and Clang only.
 
 This project is not affiliated with or endorsed by Nasdaq.

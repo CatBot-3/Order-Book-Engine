@@ -20,7 +20,7 @@
 //   - A cancel or a replace names the order by the id the exchange assigned
 //     (it is in the Accepted message). OUCH names it by the client's token.
 //   - A replace's quantity is the open quantity the order should have, as in
-//     the engine (docs/design.md, section 11), not the order's total size.
+//     the engine (docs/design.md, section 12), not the order's total size.
 //
 // Framing. A TCP stream has no message boundaries, so the receiver needs to
 // know where each message ends. Here the type byte decides it: every type has
