@@ -45,6 +45,10 @@ inline const char* name(RejectReason r) {
             return "UnknownOrder";
         case RejectReason::NotOwner:
             return "NotOwner";
+        case RejectReason::BadInstruction:
+            return "BadInstruction";
+        case RejectReason::WouldTrade:
+            return "WouldTrade";
     }
     return "?";
 }
@@ -59,6 +63,10 @@ inline const char* name(CancelReason r) {
             return "FillOrKill";
         case CancelReason::NoLiquidity:
             return "NoLiquidity";
+        case CancelReason::PostOnly:
+            return "PostOnly";
+        case CancelReason::SelfMatch:
+            return "SelfMatch";
     }
     return "?";
 }
@@ -103,13 +111,26 @@ inline void PrintTo(const Rejected& r, std::ostream* os) {
 
 inline void PrintTo(const RestingOrder& o, std::ostream* os) {
     *os << "{id " << o.id << ", owner " << o.owner << ", token " << o.token << ", " << o.qty
-        << " @ " << o.price << "}";
+        << " @ " << o.price;
+    if (o.hidden != 0 || o.display != 0) {
+        *os << ", hidden " << o.hidden << ", display " << o.display;
+    }
+    if (o.ref != 0) {
+        *os << ", ref " << o.ref;
+    }
+    if (o.post_only) {
+        *os << ", post-only";
+    }
+    if (o.self_match != SelfMatch::Allow) {
+        *os << ", self-match " << static_cast<int>(o.self_match);
+    }
+    *os << "}";
 }
 
 inline void PrintTo(const EngineStats& s, std::ostream* os) {
     *os << "{accepted " << s.accepted << ", rejected " << s.rejected << ", cancels " << s.cancels
         << ", replaces " << s.replaces << ", trades " << s.trades << ", traded " << s.traded_shares
-        << ", unfilled " << s.unfilled_shares << "}";
+        << ", unfilled " << s.unfilled_shares << ", self-matches " << s.self_matches << "}";
 }
 
 }  // namespace obe::engine

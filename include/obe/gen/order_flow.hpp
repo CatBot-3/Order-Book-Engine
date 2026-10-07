@@ -45,6 +45,13 @@ struct FlowConfig {
     // Requests that are wrong on purpose (unknown order, somebody else's
     // order, zero shares and so on), per million. They exercise the rejects.
     std::uint32_t bad_per_million = 500;
+    // Orders that carry an instruction (obe/engine/concepts.hpp), per million
+    // of the orders that could carry it. All three default to 0, and with all
+    // three at 0 the flow is, request for request, the flow it was before the
+    // instructions existed: every seed still means what it meant.
+    std::uint32_t iceberg_per_million = 0;     // of limit day orders: a display size
+    std::uint32_t post_only_per_million = 0;   // of limit day orders: rest or do nothing
+    std::uint32_t self_match_per_million = 0;  // of all orders: one of the three modes
 };
 
 enum class CommandKind : std::uint8_t { New, Cancel, Replace };
@@ -288,18 +295,57 @@ class OrderFlow {
         return Command{.kind = CommandKind::New, .order = order};
     }
 
+    [[nodiscard]] bool with_instructions() const noexcept {
+        return cfg_.iceberg_per_million != 0 || cfg_.post_only_per_million != 0 ||
+               cfg_.self_match_per_million != 0;
+    }
+
+    [[nodiscard]] bool one_in_a_million(std::uint32_t per_million) {
+        // No draw when the rate is zero, so that a flow without instructions
+        // uses exactly the random numbers it always did.
+        return per_million != 0 && rng_.below(1'000'000) < per_million;
+    }
+
+    // Gives an order the instructions its luck brings it.
+    void instruct(engine::NewOrder& o) {
+        const bool can_rest =
+            o.kind == engine::OrderKind::Limit && o.tif == engine::TimeInForce::Day;
+        if (one_in_a_million(cfg_.self_match_per_million)) {
+            o.self_match = static_cast<engine::SelfMatch>(rng_.between(1, 3));
+        }
+        if (can_rest && o.qty > 1 && one_in_a_million(cfg_.iceberg_per_million)) {
+            // Show between a half and a tenth, as a real one would: enough to
+            // be worth trading with, little enough to hide the size.
+            o.display = std::max<Qty>(1, o.qty / static_cast<Qty>(rng_.between(2, 10)));
+        }
+        if (can_rest && one_in_a_million(cfg_.post_only_per_million)) {
+            o.post_only = true;
+        }
+    }
+
     // --- The requests --------------------------------------------------------
 
+    // In the two functions below the distance is drawn before the mid takes
+    // its step, in statements of their own. Written as two arguments of one
+    // call, which of the draws came first would be the compiler's choice (the
+    // order in which arguments are evaluated is unspecified), and the same
+    // seed would give one flow under GCC and another under Clang.
     Command passive_limit() {
         engine::NewOrder o = blank_order();
-        o.price = behind(stepped_mid(o.locate), o.side, passive_distance());
+        const std::uint32_t distance = passive_distance();
+        const std::uint32_t mid = stepped_mid(o.locate);
+        o.price = behind(mid, o.side, distance);
+        instruct(o);
         return new_order(o);
     }
 
     Command aggressive_limit(engine::TimeInForce tif) {
         engine::NewOrder o = blank_order();
-        o.price = across(stepped_mid(o.locate), o.side, static_cast<std::uint32_t>(rng_.below(4)));
+        const auto distance = static_cast<std::uint32_t>(rng_.below(4));
+        const std::uint32_t mid = stepped_mid(o.locate);
+        o.price = across(mid, o.side, distance);
         o.tif = tif;
+        instruct(o);
         return new_order(o);
     }
 
@@ -307,6 +353,7 @@ class OrderFlow {
         engine::NewOrder o = blank_order();
         o.kind = engine::OrderKind::Market;
         o.tif = tif;
+        instruct(o);
         return new_order(o);
     }
 
@@ -349,7 +396,21 @@ class OrderFlow {
 
     // A request that must be rejected.
     Command bad() {
-        const std::uint64_t which = rng_.below(10);
+        const std::uint64_t which = rng_.below(with_instructions() ? 12 : 10);
+        if (which >= 10) {
+            // An instruction on an order that cannot rest.
+            engine::NewOrder o = blank_order();
+            o.price = behind(mids_[o.locate], o.side, 1);
+            if (which == 10) {
+                o.kind = engine::OrderKind::Market;
+                o.post_only = true;
+            } else {
+                o.tif = engine::TimeInForce::ImmediateOrCancel;
+                o.qty = std::max<Qty>(o.qty, 2);
+                o.display = 1;
+            }
+            return new_order(o);
+        }
         if (live_.empty() || which < 5) {
             engine::NewOrder o = blank_order();
             o.price = behind(mids_[o.locate], o.side, 1);

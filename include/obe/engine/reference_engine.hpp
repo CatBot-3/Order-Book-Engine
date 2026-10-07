@@ -71,9 +71,14 @@ class ReferenceEngine {
         if (order.kind == OrderKind::Limit && order.price == 0) {
             return reject(order.owner, order.token, 0, RejectReason::ZeroPrice, now);
         }
+        const bool is_limit = order.kind == OrderKind::Limit;
+        const bool can_rest = is_limit && order.tif == TimeInForce::Day;
+        const bool iceberg = order.display != 0 && order.display < order.qty;
+        if ((order.post_only || iceberg) && !can_rest) {
+            return reject(order.owner, order.token, 0, RejectReason::BadInstruction, now);
+        }
 
         const OrderId id = ++last_id_;
-        const bool is_limit = order.kind == OrderKind::Limit;
         ++stats_.accepted;
         reports_->on_accepted(Accepted{.order_id = id,
                                        .owner = order.owner,
@@ -87,20 +92,34 @@ class ReferenceEngine {
                                        .timestamp = now});
 
         const Price limit = effective_limit(order);
-        const Incoming incoming{id, order.owner, order.token, order.locate, order.side};
+        const Incoming incoming{.id = id,
+                                .owner = order.owner,
+                                .token = order.token,
+                                .locate = order.locate,
+                                .side = order.side,
+                                .display = order.display,
+                                .post_only = order.post_only,
+                                .self_match = known(order.self_match)};
 
-        if (order.tif == TimeInForce::FillOrKill && !can_fill(book, order.side, limit, order.qty)) {
+        if (order.post_only && would_trade(book, order.side, order.price)) {
+            drop(incoming, order.qty, CancelReason::PostOnly, now);
+            return id;
+        }
+        if (order.tif == TimeInForce::FillOrKill && !can_fill(book, incoming, limit, order.qty)) {
             drop(incoming, order.qty, CancelReason::FillOrKill, now);
             return id;
         }
 
+        // Zero is also what match() returns when self-match prevention has
+        // stopped the order and cancelled what was left of it.
         const Qty left = match(book, incoming, limit, order.qty, now);
         if (left == 0) {
             return id;
         }
-        if (is_limit && order.tif == TimeInForce::Day) {
-            rest(book, incoming, order.price, left);
-            md_->on_add(md::add(order.locate, now, id, order.side, left, book.symbol, order.price));
+        if (can_rest) {
+            const Qty shown = rest(book, incoming, order.price, left);
+            md_->on_add(
+                md::add(order.locate, now, id, order.side, shown, book.symbol, order.price));
         } else {
             drop(incoming, left,
                  is_limit ? CancelReason::ImmediateOrCancel : CancelReason::NoLiquidity, now);
@@ -121,11 +140,11 @@ class ReferenceEngine {
         const Locate locate = found->second.locate;
         const Resting order = unlink(found);
         ++stats_.cancels;
-        md_->on_delete(md::remove(locate, now, id));
+        md_->on_delete(md::remove(locate, now, order.ref));
         reports_->on_cancelled(Cancelled{.order_id = id,
                                          .owner = owner,
                                          .token = order.token,
-                                         .qty = order.qty,
+                                         .qty = order.qty + order.hidden,
                                          .leaves = 0,
                                          .reason = CancelReason::Requested,
                                          .timestamp = now});
@@ -146,18 +165,26 @@ class ReferenceEngine {
         if (new_price == 0) {
             return reject(owner, 0, id, RejectReason::ZeroPrice, now);
         }
-        ++stats_.replaces;
-
         const Locator where = found->second;
         Book& book = books_[where.locate];
+        if (where.at->post_only && would_trade(book, where.side, new_price)) {
+            return reject(owner, 0, id, RejectReason::WouldTrade, now);
+        }
+        ++stats_.replaces;
 
         // Only the size changes, and not upwards: the order stays where it is.
-        if (new_price == where.price && new_qty <= where.at->qty) {
-            const Qty removed = where.at->qty - new_qty;
-            if (removed != 0) {
-                where.at->qty = new_qty;
-                book.side(where.side).find(where.price)->second.total -= removed;
-                md_->on_cancel(md::reduce(where.locate, now, id, removed));
+        // The shares come off the part nobody can see first.
+        if (new_price == where.price && new_qty <= where.at->qty + where.at->hidden) {
+            const Qty removed = where.at->qty + where.at->hidden - new_qty;
+            const Qty from_hidden = std::min(removed, where.at->hidden);
+            const Qty from_shown = removed - from_hidden;
+            Queue& queue = book.side(where.side).find(where.price)->second;
+            where.at->hidden -= from_hidden;
+            queue.hidden -= from_hidden;
+            if (from_shown != 0) {
+                where.at->qty -= from_shown;
+                queue.total -= from_shown;
+                md_->on_cancel(md::reduce(where.locate, now, where.at->ref, from_shown));
             }
             reports_->on_replaced(Replaced{.old_id = id,
                                            .new_id = id,
@@ -174,7 +201,14 @@ class ReferenceEngine {
         // end of the queue under a new id.
         const Resting old = unlink(found);
         const OrderId new_id = ++last_id_;
-        const Incoming incoming{new_id, owner, old.token, where.locate, where.side};
+        const Incoming incoming{.id = new_id,
+                                .owner = owner,
+                                .token = old.token,
+                                .locate = where.locate,
+                                .side = where.side,
+                                .display = old.display,
+                                .post_only = old.post_only,
+                                .self_match = old.self_match};
         reports_->on_replaced(Replaced{.old_id = id,
                                        .new_id = new_id,
                                        .owner = owner,
@@ -185,19 +219,19 @@ class ReferenceEngine {
                                        .timestamp = now});
 
         if (!would_trade(book, where.side, new_price)) {
-            md_->on_replace(md::replace(where.locate, now, id, new_id, new_qty, new_price));
-            rest(book, incoming, new_price, new_qty);
+            const Qty shown = rest(book, incoming, new_price, new_qty);
+            md_->on_replace(md::replace(where.locate, now, old.ref, new_id, shown, new_price));
             return new_id;
         }
         // The market never saw an order that trades on arrival, so there is
         // nothing a Replace message could point its new reference at. The old
         // order is deleted, and what survives the trades is added afresh.
-        md_->on_delete(md::remove(where.locate, now, id));
+        md_->on_delete(md::remove(where.locate, now, old.ref));
         const Qty left = match(book, incoming, new_price, new_qty, now);
         if (left != 0) {
-            rest(book, incoming, new_price, left);
+            const Qty shown = rest(book, incoming, new_price, left);
             md_->on_add(
-                md::add(where.locate, now, new_id, where.side, left, book.symbol, new_price));
+                md::add(where.locate, now, new_id, where.side, shown, book.symbol, new_price));
         }
         return new_id;
     }
@@ -223,7 +257,16 @@ class ReferenceEngine {
     void for_each_order(Locate locate, Side side, F&& f) const {
         walk(books_[locate].side(side), side, [&f](Price price, const Queue& queue) {
             for (const Resting& order : queue.orders) {
-                if (!f(RestingOrder{order.id, order.owner, order.token, price, order.qty})) {
+                if (!f(RestingOrder{.id = order.id,
+                                    .owner = order.owner,
+                                    .token = order.token,
+                                    .price = price,
+                                    .qty = order.qty,
+                                    .hidden = order.hidden,
+                                    .display = order.display,
+                                    .ref = order.ref == order.id ? OrderId{0} : order.ref,
+                                    .post_only = order.post_only,
+                                    .self_match = order.self_match})) {
                     return false;
                 }
             }
@@ -258,8 +301,19 @@ class ReferenceEngine {
             index_.contains(order.id)) {
             return false;
         }
-        rest(book, Incoming{order.id, order.owner, order.token, locate, side}, order.price,
-             order.qty);
+        Queue& queue = book.side(side)[order.price];
+        queue.orders.push_back(Resting{.id = order.id,
+                                       .owner = order.owner,
+                                       .token = order.token,
+                                       .qty = order.qty,
+                                       .hidden = order.hidden,
+                                       .display = order.display,
+                                       .ref = order.market_ref(),
+                                       .post_only = order.post_only,
+                                       .self_match = known(order.self_match)});
+        queue.total += order.qty;
+        queue.hidden += order.hidden;
+        index_.emplace(order.id, Locator{locate, side, order.price, std::prev(queue.orders.end())});
         return true;
     }
 
@@ -274,13 +328,19 @@ class ReferenceEngine {
         OrderId id;
         OwnerId owner;
         Token token;
-        Qty qty;
+        Qty qty;      // displayed
+        Qty hidden;   // an iceberg's reserve
+        Qty display;  // the display size it was given; 0 shows everything
+        OrderId ref;  // what the market data calls it; the id until replenished
+        bool post_only;
+        SelfMatch self_match;
     };
 
-    // One price level: its orders, oldest at the front, and their total.
+    // One price level: its orders, oldest at the front, and their totals.
     struct Queue {
         std::list<Resting> orders;
-        std::uint64_t total = 0;
+        std::uint64_t total = 0;   // displayed shares: what the market sees
+        std::uint64_t hidden = 0;  // reserve shares, which fill-or-kill may count
     };
 
     using Ladder = std::map<Price, Queue>;
@@ -316,7 +376,18 @@ class ReferenceEngine {
         Token token;
         Locate locate;
         Side side;
+        Qty display;
+        bool post_only;
+        SelfMatch self_match;
     };
+
+    // Anything that is not one of the three prevention modes means Allow.
+    [[nodiscard]] static constexpr SelfMatch known(SelfMatch mode) noexcept {
+        return mode == SelfMatch::CancelIncoming || mode == SelfMatch::CancelResting ||
+                       mode == SelfMatch::CancelBoth
+                   ? mode
+                   : SelfMatch::Allow;
+    }
 
     // Calls f(price, queue) from the best level to the worst; f returning
     // false stops the walk. Bids are best at the high end of the map.
@@ -367,15 +438,43 @@ class ReferenceEngine {
         return acceptable(side, limit, top->first);
     }
 
-    // Whether `qty` shares are resting on the other side at acceptable prices.
-    [[nodiscard]] bool can_fill(const Book& book, Side side, Price limit, Qty qty) const {
-        const Side other = opposite(side);
+    // Whether a fill-or-kill order would be filled completely: whether step 2
+    // of submit, run on the book as it is, would trade `qty` shares.
+    //
+    // Hidden shares count. A replenished slice goes to the back of its level,
+    // so the incoming order reaches it after everything else at that price.
+    // That is still "at that price", except when one of the owner's own orders
+    // is in the queue and prevention stops the incoming order there: then only
+    // the displayed shares ahead of that order are reached.
+    [[nodiscard]] bool can_fill(const Book& book, const Incoming& in, Price limit, Qty qty) const {
+        const Side other = opposite(in.side);
+        const bool stops_at_own =
+            in.self_match == SelfMatch::CancelIncoming || in.self_match == SelfMatch::CancelBoth;
+        const bool skips_own = in.self_match == SelfMatch::CancelResting;
         std::uint64_t available = 0;
         walk(book.side(other), other, [&](Price price, const Queue& queue) {
-            if (!acceptable(side, limit, price)) {
+            if (!acceptable(in.side, limit, price)) {
                 return false;
             }
-            available += queue.total;
+            if (in.self_match == SelfMatch::Allow) {
+                available += queue.total + queue.hidden;
+                return available < qty;
+            }
+            const bool has_own =
+                std::any_of(queue.orders.begin(), queue.orders.end(),
+                            [&in](const Resting& order) { return order.owner == in.owner; });
+            for (const Resting& order : queue.orders) {
+                if (order.owner == in.owner) {
+                    if (stops_at_own) {
+                        return false;  // nothing beyond this order is reached
+                    }
+                    continue;  // skips_own: it will be cancelled, not traded with
+                }
+                available += order.qty;
+                if (!has_own || skips_own) {
+                    available += order.hidden;
+                }
+            }
             return available < qty;
         });
         return available >= qty;
@@ -394,6 +493,34 @@ class ReferenceEngine {
             }
             Queue& queue = level->second;
             Resting& resting = queue.orders.front();
+
+            if (in.self_match != SelfMatch::Allow && resting.owner == in.owner) {
+                ++stats_.self_matches;
+                if (in.self_match != SelfMatch::CancelIncoming) {
+                    const Resting gone = resting;
+                    index_.erase(gone.id);
+                    queue.total -= gone.qty;
+                    queue.hidden -= gone.hidden;
+                    queue.orders.pop_front();
+                    if (queue.orders.empty()) {
+                        ladder.erase(level);
+                    }
+                    md_->on_delete(md::remove(in.locate, now, gone.ref));
+                    reports_->on_cancelled(Cancelled{.order_id = gone.id,
+                                                     .owner = gone.owner,
+                                                     .token = gone.token,
+                                                     .qty = gone.qty + gone.hidden,
+                                                     .leaves = 0,
+                                                     .reason = CancelReason::SelfMatch,
+                                                     .timestamp = now});
+                }
+                if (in.self_match != SelfMatch::CancelResting) {
+                    drop(in, qty, CancelReason::SelfMatch, now);
+                    return 0;
+                }
+                continue;
+            }
+
             const Qty fill = std::min(qty, resting.qty);
             const std::uint64_t match_number = ++last_match_;
 
@@ -403,13 +530,13 @@ class ReferenceEngine {
             ++stats_.trades;
             stats_.traded_shares += fill;
 
-            md_->on_execute(md::execute(in.locate, now, resting.id, fill, match_number));
+            md_->on_execute(md::execute(in.locate, now, resting.ref, fill, match_number));
             reports_->on_executed(Executed{.order_id = resting.id,
                                            .owner = resting.owner,
                                            .token = resting.token,
                                            .qty = fill,
                                            .price = price,
-                                           .leaves = resting.qty,
+                                           .leaves = resting.qty + resting.hidden,
                                            .match_number = match_number,
                                            .liquidity = Liquidity::Added,
                                            .timestamp = now});
@@ -423,7 +550,23 @@ class ReferenceEngine {
                                            .liquidity = Liquidity::Removed,
                                            .timestamp = now});
 
-            if (resting.qty == 0) {
+            if (resting.qty != 0) {
+                continue;
+            }
+            if (resting.hidden != 0) {
+                // An iceberg shows its next slice: under a new reference, and
+                // from the back of the queue. splice moves the node without
+                // invalidating the iterator the index holds.
+                const Qty slice = std::min(resting.display, resting.hidden);
+                resting.qty = slice;
+                resting.hidden -= slice;
+                resting.ref = ++last_id_;
+                queue.total += slice;
+                queue.hidden -= slice;
+                const Resting& shown = resting;
+                queue.orders.splice(queue.orders.end(), queue.orders, queue.orders.begin());
+                md_->on_add(md::add(in.locate, now, shown.ref, other, slice, book.symbol, price));
+            } else {
                 index_.erase(resting.id);
                 queue.orders.pop_front();
                 if (queue.orders.empty()) {
@@ -434,12 +577,24 @@ class ReferenceEngine {
         return qty;
     }
 
-    // Puts an order at the back of the queue at its price.
-    void rest(Book& book, const Incoming& in, Price price, Qty qty) {
+    // Puts an order at the back of the queue at its price, showing as much of
+    // it as its display size allows. Returns the shares shown.
+    Qty rest(Book& book, const Incoming& in, Price price, Qty qty) {
+        const Qty shown = in.display != 0 ? std::min(in.display, qty) : qty;
         Queue& queue = book.side(in.side)[price];
-        queue.orders.push_back(Resting{in.id, in.owner, in.token, qty});
-        queue.total += qty;
+        queue.orders.push_back(Resting{.id = in.id,
+                                       .owner = in.owner,
+                                       .token = in.token,
+                                       .qty = shown,
+                                       .hidden = qty - shown,
+                                       .display = in.display,
+                                       .ref = in.id,
+                                       .post_only = in.post_only,
+                                       .self_match = in.self_match});
+        queue.total += shown;
+        queue.hidden += qty - shown;
         index_.emplace(in.id, Locator{in.locate, in.side, price, std::prev(queue.orders.end())});
+        return shown;
     }
 
     // Takes a resting order out of the book and returns what it was.
@@ -449,6 +604,7 @@ class ReferenceEngine {
         Ladder& ladder = books_[where.locate].side(where.side);
         const auto level = ladder.find(where.price);
         level->second.total -= order.qty;
+        level->second.hidden -= order.hidden;
         level->second.orders.erase(where.at);
         if (level->second.orders.empty()) {
             ladder.erase(level);

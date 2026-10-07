@@ -58,18 +58,22 @@ struct Options {
 };
 
 int usage(std::FILE* to, int status) {
-    std::fprintf(to,
-                 "usage: flow_gen [options] [<output file>]\n"
-                 "       flow_gen --list\n"
-                 "  --seed N       PRNG seed (default 1). The same options give the same bytes.\n"
-                 "  --commands N   requests sent to the engine (default 1000000)\n"
-                 "  --symbols N    number of securities (default 16)\n"
-                 "  --owners N     number of participants (default 8)\n"
-                 "  --live N       resting orders the flow hovers around (default 2000)\n"
-                 "  --bad N        deliberately invalid requests per million (default 500)\n"
-                 "  --engine NAME  which matching engine (default reference)\n"
-                 "  --no-verify    skip the round trip through the feed handler\n"
-                 "With no output file the run is made and summarised, and nothing is written.\n");
+    std::fprintf(
+        to,
+        "usage: flow_gen [options] [<output file>]\n"
+        "       flow_gen --list\n"
+        "  --seed N       PRNG seed (default 1). The same options give the same bytes.\n"
+        "  --commands N   requests sent to the engine (default 1000000)\n"
+        "  --symbols N    number of securities (default 16)\n"
+        "  --owners N     number of participants (default 8)\n"
+        "  --live N       resting orders the flow hovers around (default 2000)\n"
+        "  --bad N        deliberately invalid requests per million (default 500)\n"
+        "  --icebergs N   limit day orders per million given a display size (default 0)\n"
+        "  --post-only N  limit day orders per million that are post-only (default 0)\n"
+        "  --self-match N orders per million asking for self-match prevention (default 0)\n"
+        "  --engine NAME  which matching engine (default reference)\n"
+        "  --no-verify    skip the round trip through the feed handler\n"
+        "With no output file the run is made and summarised, and nothing is written.\n");
     return status;
 }
 
@@ -168,6 +172,7 @@ int run_engine(const Options& opt) {
     line("trades", stats.trades);
     line("shares traded", stats.traded_shares);
     line("shares left unfilled", stats.unfilled_shares);
+    line("self-matches prevented", stats.self_matches);
     line("orders resting at the end", engine->open_orders());
 
     std::printf("\nmarket data\n");
@@ -271,6 +276,15 @@ int run(int argc, char** argv) {
             ++i;
         } else if (arg == "--bad" && has_value) {
             opt.flow.bad_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--icebergs" && has_value) {
+            opt.flow.iceberg_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--post-only" && has_value) {
+            opt.flow.post_only_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--self-match" && has_value) {
+            opt.flow.self_match_per_million = static_cast<std::uint32_t>(value);
             ++i;
         } else if (!arg.starts_with("-") && opt.output.empty()) {
             opt.output = arg;

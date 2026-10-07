@@ -48,6 +48,10 @@ struct EnterOrder {
     Price price = 0;  // ignored for a market order
     char kind = 'L';  // 'L' limit, 'M' market
     char tif = 'D';   // 'D' day, 'I' immediate-or-cancel, 'F' fill-or-kill
+    // The instructions (obe/engine/concepts.hpp, "Instructions").
+    Qty display = 0;        // iceberg display size; 0 shows the whole order
+    char post_only = 'N';   // 'Y' or 'N'
+    char self_match = 'N';  // 'N' no prevention; cancel 'I' incoming, 'R' resting, 'B' both
 
     [[nodiscard]] constexpr char type() const noexcept { return kType; }
     template <class Self, class V>
@@ -59,6 +63,9 @@ struct EnterOrder {
         v.u32(m.price);
         v.ch(m.kind);
         v.ch(m.tif);
+        v.u32(m.display);
+        v.ch(m.post_only);
+        v.ch(m.self_match);
     }
     friend bool operator==(const EnterOrder&, const EnterOrder&) = default;
 };
@@ -164,7 +171,8 @@ struct OrderCancelled {
     OrderId order_id = 0;
     Qty qty = 0;
     // 'U' the owner asked, 'I' immediate-or-cancel remainder, 'F' fill-or-kill
-    // that could not fill, 'L' a market order that ran out of liquidity.
+    // that could not fill, 'L' a market order that ran out of liquidity, 'P' a
+    // post-only order that would have traded, 'S' self-match prevention.
     char reason = 'U';
 
     [[nodiscard]] constexpr char type() const noexcept { return kType; }
@@ -211,8 +219,10 @@ struct OrderRejected {
     engine::Token token = 0;  // of a refused Enter Order; 0 otherwise
     OrderId order_id = 0;     // of a refused Cancel or Replace; 0 otherwise
     // 'Q' zero quantity, 'P' zero price, 'S' bad side, 'I' unknown instrument,
-    // 'O' unknown order, 'N' not the owner, 'F' a field the gateway could not
-    // interpret (an order kind or time in force that does not exist).
+    // 'O' unknown order, 'N' not the owner, 'B' an instruction the order
+    // cannot carry, 'T' a replace that would make a post-only order trade,
+    // 'F' a field the gateway could not interpret (a kind, time in force or
+    // instruction byte that does not exist).
     char reason = 'Q';
 
     [[nodiscard]] constexpr char type() const noexcept { return kType; }
@@ -236,7 +246,7 @@ inline constexpr std::size_t kCancelOrderSize = feed::kWireSize<CancelOrder>;
 
 // Pinned here so that a change to a field list is a compile error and not a
 // silent change of the wire format.
-static_assert(kEnterOrderSize == 22);
+static_assert(kEnterOrderSize == 28);
 static_assert(kReplaceOrderSize == 17);
 static_assert(kCancelOrderSize == 9);
 static_assert(feed::kWireSize<OrderAccepted> == 38);
@@ -245,7 +255,7 @@ static_assert(feed::kWireSize<OrderCancelled> == 30);
 static_assert(feed::kWireSize<OrderReplaced> == 42);
 static_assert(feed::kWireSize<OrderRejected> == 26);
 
-inline constexpr std::size_t kMaxRequestSize = 22;
+inline constexpr std::size_t kMaxRequestSize = 28;
 inline constexpr std::size_t kMaxResponseSize = 46;
 
 // The size of a client-to-gateway message with this type byte, or 0 if no such
@@ -301,6 +311,20 @@ inline constexpr std::size_t kMaxResponseSize = 46;
     return 'D';
 }
 
+[[nodiscard]] constexpr char to_wire(engine::SelfMatch mode) noexcept {
+    switch (mode) {
+        case engine::SelfMatch::CancelIncoming:
+            return 'I';
+        case engine::SelfMatch::CancelResting:
+            return 'R';
+        case engine::SelfMatch::CancelBoth:
+            return 'B';
+        case engine::SelfMatch::Allow:
+            break;
+    }
+    return 'N';
+}
+
 [[nodiscard]] constexpr char to_wire(engine::CancelReason reason) noexcept {
     switch (reason) {
         case engine::CancelReason::ImmediateOrCancel:
@@ -309,6 +333,10 @@ inline constexpr std::size_t kMaxResponseSize = 46;
             return 'F';
         case engine::CancelReason::NoLiquidity:
             return 'L';
+        case engine::CancelReason::PostOnly:
+            return 'P';
+        case engine::CancelReason::SelfMatch:
+            return 'S';
         case engine::CancelReason::Requested:
             break;
     }
@@ -331,14 +359,19 @@ inline constexpr char kRejectBadField = 'F';
             return 'O';
         case engine::RejectReason::NotOwner:
             return 'N';
+        case engine::RejectReason::BadInstruction:
+            return 'B';
+        case engine::RejectReason::WouldTrade:
+            return 'T';
     }
     return kRejectBadField;
 }
 
 // Turns an Enter Order into the engine's request. Returns false, leaving out
-// alone, if the kind or the time in force is not one of the defined bytes: the
-// engine has no way to represent them, so the gateway must refuse the order
-// itself. Every other field is passed through for the engine to judge.
+// alone, if the kind, the time in force or one of the instruction bytes is not
+// one of the defined values: the engine has no way to represent them, so the
+// gateway must refuse the order itself. Every other field is passed through
+// for the engine to judge.
 [[nodiscard]] constexpr bool to_engine(const EnterOrder& m, engine::OwnerId owner,
                                        engine::NewOrder& out) noexcept {
     engine::NewOrder order{.owner = owner,
@@ -346,7 +379,8 @@ inline constexpr char kRejectBadField = 'F';
                            .locate = m.locate,
                            .side = m.side,
                            .qty = m.qty,
-                           .price = m.price};
+                           .price = m.price,
+                           .display = m.display};
     switch (m.kind) {
         case 'L':
             order.kind = engine::OrderKind::Limit;
@@ -366,6 +400,30 @@ inline constexpr char kRejectBadField = 'F';
             break;
         case 'F':
             order.tif = engine::TimeInForce::FillOrKill;
+            break;
+        default:
+            return false;
+    }
+    switch (m.post_only) {
+        case 'Y':
+            order.post_only = true;
+            break;
+        case 'N':
+            break;
+        default:
+            return false;
+    }
+    switch (m.self_match) {
+        case 'N':
+            break;
+        case 'I':
+            order.self_match = engine::SelfMatch::CancelIncoming;
+            break;
+        case 'R':
+            order.self_match = engine::SelfMatch::CancelResting;
+            break;
+        case 'B':
+            order.self_match = engine::SelfMatch::CancelBoth;
             break;
         default:
             return false;

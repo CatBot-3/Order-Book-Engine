@@ -260,8 +260,69 @@ TEST_F(GatewayTest, AnOrderIsAcceptedWithEveryFieldEchoed) {
     EXPECT_EQ(gateway->engine().best(2, Side::Sell), (book::Level{kP, 300}));
     EXPECT_EQ(gateway->stats().requests, 1U);
     EXPECT_EQ(gateway->stats().responses, 1U);
-    EXPECT_EQ(gateway->stats().bytes_in, 22U);
+    EXPECT_EQ(gateway->stats().bytes_in, 28U);
     EXPECT_EQ(gateway->stats().bytes_out, 38U);
+}
+
+// The three instructions travel in the Enter Order and come back as what the
+// engine did about them. The rules themselves are tested on the engine
+// (tests/engine/instructions_test.cpp); this is the wire.
+TEST_F(GatewayTest, InstructionsOnAnOrderReachTheEngineAndTheirOutcomesComeBack) {
+    start();
+    Client ann = connect();
+    Client bob = connect();
+
+    // An iceberg: 1'000 shares, 200 on show. The book and the feed see 200.
+    bob.send(net::EnterOrder{
+        .token = 1, .locate = 1, .side = Side::Sell, .qty = 1'000, .price = kP, .display = 200});
+    net::OrderAccepted accepted;
+    ASSERT_TRUE(read(bob, accepted));
+    EXPECT_EQ(accepted.qty, 1'000U);
+    EXPECT_EQ(gateway->engine().best(1, Side::Sell), (book::Level{kP, 200}));
+    const auto asks = test::orders_of(gateway->engine(), 1, Side::Sell);
+    ASSERT_EQ(asks.size(), 1U);
+    EXPECT_EQ(asks[0].hidden, 800U);
+
+    // Post-only at a price that would trade: accepted, then cancelled, 'P'.
+    ann.send(net::EnterOrder{
+        .token = 2, .locate = 1, .side = Side::Buy, .qty = 100, .price = kP, .post_only = 'Y'});
+    net::OrderCancelled cancelled;
+    ASSERT_TRUE(read(ann, accepted));
+    ASSERT_TRUE(read(ann, cancelled));
+    EXPECT_EQ(cancelled.order_id, accepted.order_id);
+    EXPECT_EQ(cancelled.qty, 100U);
+    EXPECT_EQ(cancelled.reason, 'P');
+
+    // Self-match prevention: Bob buys into his own iceberg, cancel-incoming.
+    bob.send(net::EnterOrder{
+        .token = 3, .locate = 1, .side = Side::Buy, .qty = 50, .price = kP, .self_match = 'I'});
+    ASSERT_TRUE(read(bob, accepted));
+    ASSERT_TRUE(read(bob, cancelled));
+    EXPECT_EQ(cancelled.order_id, accepted.order_id);
+    EXPECT_EQ(cancelled.reason, 'S');
+    EXPECT_EQ(gateway->engine().stats().self_matches, 1U);
+    EXPECT_EQ(gateway->engine().stats().trades, 0U);
+
+    // An instruction the order cannot carry is the engine's to refuse: 'B'.
+    ann.send(net::EnterOrder{.token = 4,
+                             .locate = 1,
+                             .side = Side::Buy,
+                             .qty = 100,
+                             .price = kP,
+                             .tif = 'I',
+                             .post_only = 'Y'});
+    net::OrderRejected rejected;
+    ASSERT_TRUE(read(ann, rejected));
+    EXPECT_EQ(rejected.token, 4U);
+    EXPECT_EQ(rejected.reason, 'B');
+
+    // A byte that is no instruction at all never reaches the engine: the
+    // gateway refuses it, as it does an unknown kind or time in force.
+    ann.send(net::EnterOrder{
+        .token = 5, .locate = 1, .side = Side::Buy, .qty = 100, .price = kP, .self_match = '?'});
+    ASSERT_TRUE(read(ann, rejected));
+    EXPECT_EQ(rejected.token, 5U);
+    EXPECT_EQ(rejected.reason, net::kRejectBadField);
 }
 
 TEST_F(GatewayTest, TwoClientsTradeAndEachHearsOnlyItsOwnSide) {
@@ -441,7 +502,7 @@ TEST_F(GatewayTest, ARequestThatArrivesOneByteAtATimeIsServedOnceItIsWhole) {
     ASSERT_TRUE(read(ann, accepted));
     EXPECT_EQ(accepted.token, 5U);
     EXPECT_EQ(gateway->stats().requests, 1U);
-    EXPECT_EQ(gateway->stats().bytes_in, 22U);
+    EXPECT_EQ(gateway->stats().bytes_in, 28U);
 
     // The pieces that were being kept are gone once the request is served: the
     // next request is one more request, not the first one over again.

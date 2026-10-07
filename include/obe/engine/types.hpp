@@ -37,10 +37,29 @@ enum class TimeInForce : std::uint8_t {
     FillOrKill,         // trades completely at once, or not at all
 };
 
+// What to do when an order is about to trade with a resting order of the same
+// owner. A firm running several strategies does not want them trading with
+// each other: it pays fees to move its own shares from one pocket to the
+// other, and in most markets a trade with oneself is a regulatory problem
+// (it prints volume that no change of ownership stands behind).
+//
+// The instruction belongs to the incoming order. Which of the two orders gives
+// way is the choice.
+enum class SelfMatch : std::uint8_t {
+    Allow,           // trade as with anybody else
+    CancelIncoming,  // the arriving order stops; what is left of it is cancelled
+    CancelResting,   // the resting order is cancelled; the arriving one carries on
+    CancelBoth,      // the resting order is cancelled and the arriving one stops
+};
+
 // A request to enter an order.
 //
 // A market order never rests, whatever its time in force: with no price there
 // is no level to put it on. Day and ImmediateOrCancel mean the same for it.
+//
+// The last three fields are instructions. Each has a default that means "no
+// instruction", and an order with all three at their defaults is a plain
+// order. The rules for them are under "Instructions" in concepts.hpp.
 struct NewOrder {
     OwnerId owner = 0;
     Token token = 0;
@@ -50,6 +69,12 @@ struct NewOrder {
     Price price = 0;
     OrderKind kind = OrderKind::Limit;
     TimeInForce tif = TimeInForce::Day;
+    // Iceberg: the most the market may see of the order at once. 0, or
+    // anything not below `qty`, shows all of it.
+    Qty display = 0;
+    // Rest or do nothing: an order that would trade on arrival is cancelled.
+    bool post_only = false;
+    SelfMatch self_match = SelfMatch::Allow;
 
     friend bool operator==(const NewOrder&, const NewOrder&) = default;
 };
@@ -61,6 +86,8 @@ enum class RejectReason : std::uint8_t {
     UnknownInstrument,  // no add_instrument() was made for the locate
     UnknownOrder,       // cancel or replace of an order that is not resting
     NotOwner,           // cancel or replace of somebody else's order
+    BadInstruction,     // post-only or iceberg on an order that cannot rest
+    WouldTrade,         // a replace that would make a post-only order trade
 };
 
 enum class CancelReason : std::uint8_t {
@@ -68,6 +95,8 @@ enum class CancelReason : std::uint8_t {
     ImmediateOrCancel,  // the part of an immediate-or-cancel order that found nothing
     FillOrKill,         // a fill-or-kill order that could not be filled completely
     NoLiquidity,        // the part of a market order left when the other side ran out
+    PostOnly,           // a post-only order that would have traded on arrival
+    SelfMatch,          // self-match prevention: see engine::SelfMatch
 };
 
 // Which role the order played in a trade. The values are the bytes OUCH uses.
@@ -155,25 +184,50 @@ struct Rejected {
 };
 
 // One resting order, as the engine shows it to a walk over the book.
+//
+// For a plain order the first five fields say everything, and the rest keep
+// their defaults (with `ref` equal to `id`). An iceberg has shares the market
+// cannot see, and a name in the market data that changes each time more of it
+// is shown; an order's instructions stay with it for as long as it rests.
 struct RestingOrder {
     OrderId id = 0;
     OwnerId owner = 0;
     Token token = 0;
     Price price = 0;
-    Qty qty = 0;  // shares still open
+    Qty qty = 0;  // shares open AND displayed: what the market data shows
+
+    Qty hidden = 0;   // shares open and not displayed (an iceberg's reserve)
+    Qty display = 0;  // an iceberg's display size; 0 for a plain order
+    // The order reference the market data currently knows this order by.
+    // 0 here means "the same as id", which is what it is for every order that
+    // is not an iceberg past its first slice.
+    OrderId ref = 0;
+    bool post_only = false;
+    SelfMatch self_match = SelfMatch::Allow;
+
+    // Shares still open, seen or not.
+    [[nodiscard]] constexpr std::uint64_t open() const noexcept {
+        return std::uint64_t{qty} + hidden;
+    }
+    // The reference the market data uses for it.
+    [[nodiscard]] constexpr OrderId market_ref() const noexcept { return ref == 0 ? id : ref; }
 
     friend bool operator==(const RestingOrder&, const RestingOrder&) = default;
 };
 
 // Totals since the engine was created.
 struct EngineStats {
-    std::uint64_t accepted = 0;         // new orders that got an id
-    std::uint64_t rejected = 0;         // requests refused, of any kind
-    std::uint64_t cancels = 0;          // cancel requests that removed an order
-    std::uint64_t replaces = 0;         // replace requests that went through
-    std::uint64_t trades = 0;           // matches; each has two sides
-    std::uint64_t traded_shares = 0;    // shares over all matches, counted once
-    std::uint64_t unfilled_shares = 0;  // cancelled by IOC, FOK and market leftovers
+    std::uint64_t accepted = 0;       // new orders that got an id
+    std::uint64_t rejected = 0;       // requests refused, of any kind
+    std::uint64_t cancels = 0;        // cancel requests that removed an order
+    std::uint64_t replaces = 0;       // replace requests that went through
+    std::uint64_t trades = 0;         // matches; each has two sides
+    std::uint64_t traded_shares = 0;  // shares over all matches, counted once
+    // Shares of arriving orders that the engine cancelled itself: what IOC,
+    // FOK and market orders could not fill, post-only orders that would have
+    // traded, and what self-match prevention stopped.
+    std::uint64_t unfilled_shares = 0;
+    std::uint64_t self_matches = 0;  // times self-match prevention stepped in
 
     friend bool operator==(const EngineStats&, const EngineStats&) = default;
 };

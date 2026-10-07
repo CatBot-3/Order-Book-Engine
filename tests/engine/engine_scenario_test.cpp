@@ -12,6 +12,7 @@
 #include "obe/feed/messages.hpp"
 #include "support/engine_harness.hpp"
 #include "support/naive_engine.hpp"
+#include "support/scenario_fixture.hpp"
 
 // Scenario tests: one for each order type and each edge the contract in
 // obe/engine/concepts.hpp describes. They assume only that contract, and check
@@ -43,121 +44,10 @@ using engine::TimeInForce;
 using test::MdMessage;
 using test::Report;
 
-constexpr Locate kStock = 7;
-constexpr Locate kOther = 8;
-constexpr Locate kUnopened = 9;
-constexpr OwnerId kAnn = 1;
-constexpr OwnerId kBob = 2;
-constexpr OwnerId kCat = 3;
-constexpr Price kP = 1'000'000;  // $100.00
-constexpr Price kTick = 100;     // one cent
-constexpr feed::Symbol kSymbol = feed::Symbol::from("ACME");
-// A side byte that is neither 'B' nor 'S', as a corrupt or hostile request
-// would carry. The cast is well defined: Side has a fixed underlying type.
-// NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
-constexpr Side kBadSide = static_cast<Side>('X');
+using namespace test::scenario;
 
 template <class Impl>
-class EngineScenario : public ::testing::Test {
- protected:
-    using Engine = typename Impl::template Engine<test::ReportLog, test::MdLog>;
-
-    void SetUp() override {
-        ASSERT_TRUE(engine->add_instrument(kStock, kSymbol, tick()));
-        ASSERT_TRUE(engine->add_instrument(kOther, feed::Symbol::from("OTHR"), tick()));
-        forget();
-    }
-
-    // Each request gets its own time, so a test can tell which request an
-    // output belongs to.
-    Nanos tick() { return now += 1000; }
-
-    // Empties the logs, so a test sees only what its last step produced.
-    void forget() {
-        reports.clear();
-        md.clear();
-    }
-
-    OrderId submit(NewOrder order) {
-        order.token = ++token;
-        return engine->submit(order, tick());
-    }
-    OrderId buy(Price price, Qty qty, OwnerId owner = kAnn, TimeInForce tif = TimeInForce::Day) {
-        return submit({.owner = owner,
-                       .locate = kStock,
-                       .side = Side::Buy,
-                       .qty = qty,
-                       .price = price,
-                       .tif = tif});
-    }
-    OrderId sell(Price price, Qty qty, OwnerId owner = kBob, TimeInForce tif = TimeInForce::Day) {
-        return submit({.owner = owner,
-                       .locate = kStock,
-                       .side = Side::Sell,
-                       .qty = qty,
-                       .price = price,
-                       .tif = tif});
-    }
-    OrderId market(Side side, Qty qty, OwnerId owner = kCat, TimeInForce tif = TimeInForce::Day) {
-        return submit({.owner = owner,
-                       .locate = kStock,
-                       .side = side,
-                       .qty = qty,
-                       .kind = OrderKind::Market,
-                       .tif = tif});
-    }
-    bool cancel(OwnerId owner, OrderId id) { return engine->cancel(owner, id, tick()); }
-    OrderId replace(OwnerId owner, OrderId id, Qty qty, Price price) {
-        return engine->replace(owner, id, qty, price, tick());
-    }
-
-    [[nodiscard]] std::vector<Level> bids() const {
-        return test::levels_of(*engine, kStock, Side::Buy);
-    }
-    [[nodiscard]] std::vector<Level> asks() const {
-        return test::levels_of(*engine, kStock, Side::Sell);
-    }
-    [[nodiscard]] std::vector<RestingOrder> bid_orders() const {
-        return test::orders_of(*engine, kStock, Side::Buy);
-    }
-    [[nodiscard]] std::vector<RestingOrder> ask_orders() const {
-        return test::orders_of(*engine, kStock, Side::Sell);
-    }
-    // The ids of one side, in the order they would trade.
-    [[nodiscard]] std::vector<OrderId> ids(Side side) const {
-        std::vector<OrderId> out;
-        for (const RestingOrder& o : test::orders_of(*engine, kStock, side)) {
-            out.push_back(o.id);
-        }
-        return out;
-    }
-
-    // An Executed report for the last request.
-    [[nodiscard]] Executed fill(OrderId id, OwnerId owner, engine::Token order_token, Qty qty,
-                                Price price, Qty leaves, std::uint64_t match,
-                                Liquidity liquidity) const {
-        return Executed{.order_id = id,
-                        .owner = owner,
-                        .token = order_token,
-                        .qty = qty,
-                        .price = price,
-                        .leaves = leaves,
-                        .match_number = match,
-                        .liquidity = liquidity,
-                        .timestamp = now};
-    }
-
-    test::ReportLog reports;
-    test::MdLog md;
-    std::unique_ptr<Engine> engine = std::make_unique<Engine>(reports, md);
-    Nanos now = 0;
-    engine::Token token = 100;
-};
-#if defined(OBE_TEST_HAND_WRITTEN)
-using ScenarioEngines = test::EngineTypes;
-#else
-using ScenarioEngines = ::testing::Types<engine::ReferenceEngineImpl, test::NaiveEngineImpl>;
-#endif
+class EngineScenario : public test::scenario::ScenarioFixture<Impl> {};
 TYPED_TEST_SUITE(EngineScenario, ScenarioEngines);
 
 // --- Instruments -------------------------------------------------------------

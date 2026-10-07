@@ -279,10 +279,11 @@ TEST(Snapshot, TheDigestCoversEachTotalSeparately) {
     Replica plain;
     const std::uint64_t base = journal::state_digest(*plain.engine, kLocates);
     std::uint64_t engine::EngineStats::*const totals[] = {
-        &engine::EngineStats::accepted,       &engine::EngineStats::rejected,
-        &engine::EngineStats::cancels,        &engine::EngineStats::replaces,
-        &engine::EngineStats::trades,         &engine::EngineStats::traded_shares,
-        &engine::EngineStats::unfilled_shares};
+        &engine::EngineStats::accepted,        &engine::EngineStats::rejected,
+        &engine::EngineStats::cancels,         &engine::EngineStats::replaces,
+        &engine::EngineStats::trades,          &engine::EngineStats::traded_shares,
+        &engine::EngineStats::unfilled_shares, &engine::EngineStats::self_matches};
+    static_assert(sizeof(engine::EngineStats) == sizeof(totals), "a total is missing here");
     std::vector<std::uint64_t> seen{base};
     for (const auto total : totals) {
         Replica r;
@@ -379,6 +380,40 @@ TEST(Restorable, RestoredOrdersQueueInTheOrderGivenAndCanBeCancelledByTheirOwner
     EXPECT_EQ(r.engine->open_orders(), 2U);
 }
 
+// A restored iceberg's reserve has to be counted where a fill-or-kill counts
+// it. Listed, the order looks right whether the engine added its hidden shares
+// to the level's reserve or not; only an order that needs those shares shows
+// which.
+TEST(Restorable, ARestoredReserveIsThereForAFillOrKill) {
+    Replica r;
+    ASSERT_TRUE(r.engine->restore_instrument(1, feed::Symbol::from("AAAA")));
+    ASSERT_TRUE(r.engine->restore_order(1, Side::Sell,
+                                        {.id = 5,
+                                         .owner = 1,
+                                         .token = 0,
+                                         .price = 10'000,
+                                         .qty = 100,
+                                         .hidden = 400,
+                                         .display = 100}));
+    r.engine->restore_counters({.last_order_id = 5, .last_match_number = 0}, {});
+    const auto fill_or_kill = [&r](Qty qty) {
+        r.engine->submit({.owner = 2,
+                          .token = 1,
+                          .locate = 1,
+                          .side = Side::Buy,
+                          .qty = qty,
+                          .price = 10'000,
+                          .tif = engine::TimeInForce::FillOrKill},
+                         9);
+    };
+    fill_or_kill(501);  // one more than is there
+    EXPECT_EQ(r.engine->stats().traded_shares, 0U);
+    EXPECT_EQ(r.engine->open_orders(), 1U);
+    fill_or_kill(500);  // all of it, four fifths of which are hidden
+    EXPECT_EQ(r.engine->stats().traded_shares, 500U) << "the hidden shares were not counted";
+    EXPECT_EQ(r.engine->open_orders(), 0U);
+}
+
 // --- restore() ---------------------------------------------------------------------
 
 // A state that is right in every way, to spoil one thing at a time.
@@ -392,12 +427,26 @@ EngineState good_state() {
                .replaces = 1,
                .trades = 4,
                .traded_shares = 400,
-               .unfilled_shares = 30};
+               .unfilled_shares = 30,
+               .self_matches = 6};
     s.instruments = {{1, feed::Symbol::from("AAAA")}, {2, feed::Symbol::from("BBBB")}};
     s.orders = {
         {1, Side::Buy, {3, 1, 11, 10'000, 100}},
         {1, Side::Buy, {5, 2, 12, 9'900, 200}},
-        {1, Side::Sell, {4, 1, 13, 10'100, 300}},
+        // An iceberg on its second slice (the market knows it as 8), which is
+        // also post-only and cancels its owner's resting orders on meeting them.
+        {1,
+         Side::Sell,
+         {.id = 4,
+          .owner = 1,
+          .token = 13,
+          .price = 10'100,
+          .qty = 300,
+          .hidden = 700,
+          .display = 350,
+          .ref = 8,
+          .post_only = true,
+          .self_match = engine::SelfMatch::CancelResting}},
         {2, Side::Sell, {9, 3, 14, 500, 400}},
     };
     return s;
@@ -433,6 +482,29 @@ TEST(Snapshot, AStateNoEngineCouldHoldIsRefusedBeforeAnythingIsTouched) {
         {"a locked book", [](EngineState& s) { s.orders[2].order.price = 10'000; }},
         {"a book crossed by a bid that is not the first listed",
          [](EngineState& s) { s.orders[1].order.price = 10'200; }},
+        {"hidden shares on an order with no display size",
+         [](EngineState& s) { s.orders[0].order.hidden = 5; }},
+        {"an iceberg showing more than its display size while it still hides some",
+         [](EngineState& s) { s.orders[2].order.qty = 351; }},
+        {"more open shares than an order can be entered for",
+         [](EngineState& s) {
+             s.orders[2].order.display = ~Qty{0};
+             s.orders[2].order.qty = ~Qty{0};
+             s.orders[2].order.hidden = 1;
+         }},
+        {"a market reference that is another order's id",
+         [](EngineState& s) { s.orders[2].order.ref = 9; }},
+        {"a market reference the counter has not reached",
+         [](EngineState& s) { s.orders[2].order.ref = 10; }},
+        {"two orders known to the market by one reference",
+         [](EngineState& s) { s.orders[0].order.ref = 8; }},
+        {"a market reference that only repeats the order's id",
+         [](EngineState& s) { s.orders[0].order.ref = 3; }},
+        {"a self-match instruction no engine keeps",
+         [](EngineState& s) {
+             // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+             s.orders[0].order.self_match = static_cast<engine::SelfMatch>(4);
+         }},
         {"a book crossed by an ask that is not the last listed",
          [](EngineState& s) {
              s.orders.push_back({1, Side::Sell, {6, 1, 15, 10'300, 10}});
@@ -473,6 +545,25 @@ TEST(Snapshot, ThingsThatLookOddButAreNotWrongAreAccepted) {
         SCOPED_TRACE("a book one tick wide");
         EngineState s = good_state();
         s.orders[2].order.price = 10'001;
+        EXPECT_TRUE(journal::plausible(s));
+    }
+    {
+        SCOPED_TRACE("an iceberg down to its last slice: a display size and nothing hidden");
+        EngineState s = good_state();
+        s.orders[2].order.hidden = 0;
+        EXPECT_TRUE(journal::plausible(s));
+    }
+    {
+        SCOPED_TRACE("an iceberg showing exactly its display size");
+        EngineState s = good_state();
+        s.orders[2].order.qty = 350;
+        EXPECT_TRUE(journal::plausible(s));
+    }
+    {
+        SCOPED_TRACE("a market reference at the counter exactly");
+        EngineState s = good_state();
+        s.counters.last_order_id = 10;
+        s.orders[2].order.ref = 10;
         EXPECT_TRUE(journal::plausible(s));
     }
     {
@@ -551,28 +642,30 @@ TEST(SnapshotFile, IsLaidOutAsDocumented) {
     const EngineState state = good_state();
     const std::vector<std::byte> file = journal::encode(state);
 
-    ASSERT_EQ(file.size(), 96U + 2 * 10 + 4 * 31 + 4);
+    ASSERT_EQ(file.size(), 104U + 2 * 10 + 4 * 49 + 4);
     EXPECT_EQ(static_cast<char>(file[0]), 'O');
     EXPECT_EQ(static_cast<char>(file[1]), 'B');
     EXPECT_EQ(static_cast<char>(file[2]), 'E');
     EXPECT_EQ(static_cast<char>(file[3]), 'S');
-    EXPECT_EQ(u16_at(file, 4), 1U);
+    EXPECT_EQ(u16_at(file, 4), 2U);  // version
     EXPECT_EQ(u16_at(file, 6), 0U);
     EXPECT_EQ(u64_at(file, 8), 10U);  // next journal sequence
     EXPECT_EQ(u64_at(file, 16), 9U);  // last order id
     EXPECT_EQ(u64_at(file, 24), 4U);  // last match number
-    const std::uint64_t stats[7] = {9, 1, 2, 1, 4, 400, 30};
-    for (std::size_t i = 0; i < 7; ++i) {
+    const std::uint64_t stats[8] = {9, 1, 2, 1, 4, 400, 30, 6};
+    for (std::size_t i = 0; i < 8; ++i) {
         EXPECT_EQ(u64_at(file, 32 + 8 * i), stats[i]) << i;
     }
-    EXPECT_EQ(u32_at(file, 88), 2U);
-    EXPECT_EQ(u32_at(file, 92), 4U);
+    EXPECT_EQ(u32_at(file, 96), 2U);
+    EXPECT_EQ(u32_at(file, 100), 4U);
     // The second instrument.
-    EXPECT_EQ(u16_at(file, 106), 2U);
-    EXPECT_EQ(static_cast<char>(file[108]), 'B');
-    EXPECT_EQ(static_cast<char>(file[115]), ' ');
-    // The third order: locate 1, sell, id 4, owner 1, token 13, 300 @ 10'100.
-    const std::size_t at = 96 + 20 + 2 * 31;
+    EXPECT_EQ(u16_at(file, 114), 2U);
+    EXPECT_EQ(static_cast<char>(file[116]), 'B');
+    EXPECT_EQ(static_cast<char>(file[123]), ' ');
+    // The third order, the one with something in every field: locate 1, sell,
+    // id 4, owner 1, token 13, 300 showing at 10'100, 700 hidden, display 350,
+    // known to the market as 8, post-only, self-match mode 2.
+    const std::size_t at = 104 + 20 + 2 * 49;
     EXPECT_EQ(u16_at(file, at), 1U);
     EXPECT_EQ(static_cast<char>(file[at + 2]), 'S');
     EXPECT_EQ(u64_at(file, at + 3), 4U);
@@ -580,8 +673,35 @@ TEST(SnapshotFile, IsLaidOutAsDocumented) {
     EXPECT_EQ(u64_at(file, at + 15), 13U);
     EXPECT_EQ(u32_at(file, at + 23), 10'100U);
     EXPECT_EQ(u32_at(file, at + 27), 300U);
+    EXPECT_EQ(u32_at(file, at + 31), 700U);
+    EXPECT_EQ(u32_at(file, at + 35), 350U);
+    EXPECT_EQ(u64_at(file, at + 39), 8U);
+    EXPECT_EQ(file[at + 47], std::byte{1});
+    EXPECT_EQ(file[at + 48], std::byte{2});
+    // A plain order writes zeros in all five: the order before it.
+    const std::size_t plain = at - 49;
+    EXPECT_EQ(u32_at(file, plain + 31), 0U);
+    EXPECT_EQ(u32_at(file, plain + 35), 0U);
+    EXPECT_EQ(u64_at(file, plain + 39), 0U);
+    EXPECT_EQ(file[plain + 47], std::byte{0});
+    EXPECT_EQ(file[plain + 48], std::byte{0});
     // And the checksum of all of it at the end.
     EXPECT_EQ(u32_at(file, file.size() - 4), util::crc32({file.data(), file.size() - 4}));
+}
+
+// The post-only byte is written as 0 or 1. A file with anything else there
+// was not written by this code, and reading it as "true" would let two
+// different files decode to the same state.
+TEST(SnapshotFile, AFlagByteThatIsNeitherZeroNorOneIsRefused) {
+    std::vector<std::byte> file = journal::encode(good_state());
+    const std::size_t flag = 104 + 20 + 2 * 49 + 47;
+    ASSERT_EQ(file[flag], std::byte{1});
+    file[flag] = std::byte{2};
+    reseal(file);
+    EXPECT_FALSE(journal::decode(file).has_value());
+    file[flag] = std::byte{0};
+    reseal(file);
+    EXPECT_TRUE(journal::decode(file).has_value());
 }
 
 TEST(SnapshotFile, SurvivesTheRoundTripWithEveryFieldAtItsLargest) {
@@ -595,12 +715,22 @@ TEST(SnapshotFile, SurvivesTheRoundTripWithEveryFieldAtItsLargest) {
                    .replaces = ~std::uint64_t{0} - 6,
                    .trades = ~std::uint64_t{0} - 7,
                    .traded_shares = ~std::uint64_t{0} - 8,
-                   .unfilled_shares = ~std::uint64_t{0} - 9};
+                   .unfilled_shares = ~std::uint64_t{0} - 9,
+                   .self_matches = ~std::uint64_t{0} - 15};
     state.instruments = {{65'535, feed::Symbol::from("ZZZZZZZZ")}};
     state.orders = {{65'535,
                      Side::Sell,
-                     {~std::uint64_t{0} - 10, ~std::uint32_t{0} - 11, ~std::uint64_t{0} - 12,
-                      ~std::uint32_t{0} - 13, ~std::uint32_t{0} - 14}}};
+                     {.id = ~std::uint64_t{0} - 10,
+                      .owner = ~std::uint32_t{0} - 11,
+                      .token = ~std::uint64_t{0} - 12,
+                      .price = ~std::uint32_t{0} - 13,
+                      .qty = ~std::uint32_t{0} - 14,
+                      .hidden = ~std::uint32_t{0} - 16,
+                      .display = ~std::uint32_t{0} - 17,
+                      .ref = ~std::uint64_t{0} - 18,
+                      .post_only = true,
+                      // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+                      .self_match = static_cast<engine::SelfMatch>(255)}}};
     const std::optional<EngineState> back = journal::decode(journal::encode(state));
     ASSERT_TRUE(back.has_value());
     EXPECT_EQ(*back, state);
@@ -645,7 +775,15 @@ TEST(SnapshotFile, AWholeFileOfTheWrongKindIsRefused) {
     {
         SCOPED_TRACE("a later version");
         std::vector<std::byte> file = good;
-        feed::store_be<std::uint16_t>(file.data() + 4, 2);
+        ASSERT_EQ(u16_at(file, 4), 2U) << "the current version";
+        feed::store_be<std::uint16_t>(file.data() + 4, 3);
+        reseal(file);
+        EXPECT_FALSE(journal::decode(file).has_value());
+    }
+    {
+        SCOPED_TRACE("the version before, whose orders were shorter");
+        std::vector<std::byte> file = good;
+        feed::store_be<std::uint16_t>(file.data() + 4, 1);
         reseal(file);
         EXPECT_FALSE(journal::decode(file).has_value());
     }
@@ -685,8 +823,8 @@ TEST(SnapshotFile, CountsThatDoNotMatchTheLengthAreRefusedWithoutBeingBelieved) 
     for (const Counts& c : wrong) {
         SCOPED_TRACE(::testing::Message() << c.instruments << " and " << c.orders);
         std::vector<std::byte> file = good;
-        feed::store_be<std::uint32_t>(file.data() + 88, c.instruments);
-        feed::store_be<std::uint32_t>(file.data() + 92, c.orders);
+        feed::store_be<std::uint32_t>(file.data() + 96, c.instruments);
+        feed::store_be<std::uint32_t>(file.data() + 100, c.orders);
         reseal(file);
         EXPECT_FALSE(journal::decode(file).has_value());
     }

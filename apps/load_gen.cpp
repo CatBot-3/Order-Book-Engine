@@ -11,6 +11,8 @@
 //     --warmup N            unmeasured seconds before them, at each rate (default 1)
 //     --symbols N           instruments the server has open (default 16)
 //     --live N              resting orders the flow hovers around (default 2000)
+//     --icebergs N --post-only N --self-match N
+//                           orders per million that carry each instruction (default 0)
 //     --seed N              seed of the order flow (default 1)
 //     --cpu N               pin this thread to CPU N
 //     --json FILE           also write the results as JSON
@@ -262,7 +264,10 @@ class LoadGenerator {
                                                  .qty = c.order.qty,
                                                  .price = c.order.price,
                                                  .kind = net::to_wire(c.order.kind),
-                                                 .tif = net::to_wire(c.order.tif)});
+                                                 .tif = net::to_wire(c.order.tif),
+                                                 .display = c.order.display,
+                                                 .post_only = c.order.post_only ? 'Y' : 'N',
+                                                 .self_match = net::to_wire(c.order.self_match)});
                 break;
             case gen::CommandKind::Cancel:
                 append(conn.out, net::CancelOrder{.order_id = c.target});
@@ -557,6 +562,15 @@ int run(int argc, char** argv) {
             ++i;
         } else if (arg == "--live" && has_value) {
             opt.flow.target_live_orders = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--icebergs" && has_value) {
+            opt.flow.iceberg_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--post-only" && has_value) {
+            opt.flow.post_only_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--self-match" && has_value) {
+            opt.flow.self_match_per_million = static_cast<std::uint32_t>(value);
             ++i;
         } else if (arg == "--seed" && has_value) {
             opt.flow.seed = value;

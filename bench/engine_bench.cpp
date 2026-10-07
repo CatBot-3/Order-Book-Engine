@@ -8,6 +8,8 @@
 //     --symbols N        securities (default 100)
 //     --owners N         participants (default 16)
 //     --live N           resting orders the flow hovers around (default 20000)
+//     --icebergs N --post-only N --self-match N
+//                        orders per million that carry each instruction (default 0)
 //     --sinks null|feed  what receives the engine's output (default: null)
 //                          null  nothing: matching and book-keeping only
 //                          feed  every market-data message is encoded to bytes
@@ -92,7 +94,8 @@ int usage(std::FILE* to, int status) {
     std::fprintf(to,
                  "usage: engine_bench [--engine NAME] [--seed N] [--commands N] [--symbols N] "
                  "[--owners N]\n"
-                 "                    [--live N] [--sinks null|feed] [--runs N] [--warmup N] "
+                 "                    [--live N] [--icebergs N] [--post-only N] [--self-match N]\n"
+                 "                    [--sinks null|feed] [--runs N] [--warmup N] "
                  "[--cpu N]\n"
                  "                    [--clock tsc|steady] [--no-verify] [--json FILE] "
                  "[--label TEXT]\n");
@@ -570,6 +573,15 @@ int run(int argc, char** argv) {
             ++i;
         } else if (arg == "--live" && has_value) {
             opt.flow.target_live_orders = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--icebergs" && has_value) {
+            opt.flow.iceberg_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--post-only" && has_value) {
+            opt.flow.post_only_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--self-match" && has_value) {
+            opt.flow.self_match_per_million = static_cast<std::uint32_t>(value);
             ++i;
         } else if (arg == "--runs" && has_value) {
             opt.runs = static_cast<int>(value);

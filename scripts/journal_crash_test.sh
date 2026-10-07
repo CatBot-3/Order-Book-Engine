@@ -42,7 +42,10 @@ rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
 RANDOM=$SEED
 
-FLOW=(--seed 4242 --commands 20000 --symbols 4 --live 300 --engine "$ENGINE")
+# Some of every instruction, so that the journal carries them and recovery has
+# icebergs in the middle of their slices to put back.
+FLOW=(--seed 4242 --commands 20000 --symbols 4 --live 300 --engine "$ENGINE"
+    --icebergs 200000 --post-only 100000 --self-match 300000)
 MAX_ROUNDS=300
 
 fail() {

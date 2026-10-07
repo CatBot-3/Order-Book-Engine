@@ -41,6 +41,55 @@ TEST(OrderFlow, TheSameConfigGivesTheSameRequests) {
     EXPECT_EQ(commands_of(cfg, 5'000), commands_of(cfg, 5'000));
 }
 
+// What the generator produces for a seed is something other things rest on:
+// the tapes two builds are benchmarked on, and the seed a failing test is
+// reported by. So it is pinned to a number, which catches two things.
+//
+// Instructions were added later, and must not have moved it: with every
+// instruction rate at zero, which is the default, the requests are field for
+// field what they were before instructions existed. The two numbers below
+// were taken from that version of the generator, built with GCC.
+//
+// And the number is the same under every compiler. It was not always: two
+// draws were once made in the arguments of one call, an order the language
+// leaves open, and Clang's flow differed from GCC's. This test is what found
+// it.
+TEST(OrderFlow, WithoutInstructionsTheRequestsAreWhatTheyWereBeforeThereWereAny) {
+    const auto hash_of = [](const gen::FlowConfig& cfg) {
+        std::uint64_t h = 0xcbf29ce484222325ULL;
+        const auto mix = [&h](std::uint64_t v) {
+            h ^= v;
+            h *= 0x100000001b3ULL;
+            h ^= h >> 32;
+        };
+        for (const Command& c : commands_of(cfg, 20'000)) {
+            mix(static_cast<std::uint64_t>(c.kind));
+            mix(c.now);
+            mix(c.order.owner);
+            mix(c.order.token);
+            mix(c.order.locate);
+            mix(static_cast<std::uint64_t>(c.order.side));
+            mix(c.order.qty);
+            mix(c.order.price);
+            mix(static_cast<std::uint64_t>(c.order.kind));
+            mix(static_cast<std::uint64_t>(c.order.tif));
+            mix(c.owner);
+            mix(c.target);
+            mix(c.qty);
+            mix(c.price);
+            EXPECT_EQ(c.order.display, 0U);
+            EXPECT_FALSE(c.order.post_only);
+            EXPECT_EQ(c.order.self_match, engine::SelfMatch::Allow);
+        }
+        return h;
+    };
+    EXPECT_EQ(hash_of({.seed = 42, .symbols = 5, .target_live_orders = 300}),
+              0xa0221005217acadbULL);
+    EXPECT_EQ(
+        hash_of({.seed = 7, .symbols = 6, .target_live_orders = 250, .bad_per_million = 20'000}),
+        0xe2406406faedf7b1ULL);
+}
+
 TEST(OrderFlow, ADifferentSeedGivesDifferentRequests) {
     gen::FlowConfig a{.seed = 42, .symbols = 5, .target_live_orders = 300};
     gen::FlowConfig b = a;

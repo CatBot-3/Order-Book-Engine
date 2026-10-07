@@ -101,6 +101,7 @@ int usage(std::FILE* to, int status) {
         "there, then carries on until it holds --commands requests.\n"
         "  --commands N         requests the journal should hold at the end (default 200000)\n"
         "  --seed N --symbols N --owners N --live N --bad N    the flow, as in flow_gen\n"
+        "  --icebergs N --post-only N --self-match N           and its instructions, per million\n"
         "  --engine NAME        which matching engine (default reference)\n"
         "  --batch N            requests gathered before each write (default 1)\n"
         "  --sync never|flush   whether to fdatasync after each write (default never)\n"
@@ -599,6 +600,15 @@ int run(int argc, char** argv) {
             ++i;
         } else if (arg == "--bad" && has_value) {
             opt.flow.bad_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--icebergs" && has_value) {
+            opt.flow.iceberg_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--post-only" && has_value) {
+            opt.flow.post_only_per_million = static_cast<std::uint32_t>(value);
+            ++i;
+        } else if (arg == "--self-match" && has_value) {
+            opt.flow.self_match_per_million = static_cast<std::uint32_t>(value);
             ++i;
         } else if (arg == "--batch" && has_value && value >= 1 && value <= 1'000'000) {
             opt.batch = static_cast<std::uint32_t>(value);

@@ -52,8 +52,8 @@ target_compile_definitions(obe_hand_written_tests PRIVATE OBE_TEST_HAND_WRITTEN)
 # The matching engine (phase 5). The same split as the book: the suites run on
 # the reference engine in the passing build, and again on the hand-written
 # MatchingEngine, with the differential test against the reference added.
-set(OBE_ENGINE_TEST_SOURCES engine/engine_scenario_test.cpp engine/engine_property_test.cpp
-                            engine/round_trip_test.cpp)
+set(OBE_ENGINE_TEST_SOURCES engine/engine_scenario_test.cpp engine/instructions_test.cpp
+                            engine/engine_property_test.cpp engine/round_trip_test.cpp)
 obe_add_test(
   obe_engine_tests
   LABELS unit

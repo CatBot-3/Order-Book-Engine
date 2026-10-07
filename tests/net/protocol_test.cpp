@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include "obe/engine/types.hpp"
@@ -27,21 +28,27 @@ std::vector<std::byte> bytes_of(const M& m) {
 }
 
 TEST(Protocol, EnterOrderHasItsFieldsWhereTheSpecificationPutsThem) {
-    test::Wire wire('O', 22);
+    test::Wire wire('O', 28);
     wire.u64(1, 0x1122334455667788ULL)  // token
         .u16(9, 7)                      // locate
         .ch(11, 'S')                    // side
         .u32(12, 300)                   // quantity
         .u32(16, 1'000'100)             // price
         .ch(20, 'L')                    // kind
-        .ch(21, 'I');                   // time in force
+        .ch(21, 'I')                    // time in force
+        .u32(22, 0x0A0B0C0D)            // display size
+        .ch(26, 'Y')                    // post-only
+        .ch(27, 'R');                   // self-match prevention
     const net::EnterOrder expected{.token = 0x1122334455667788ULL,
                                    .locate = 7,
                                    .side = Side::Sell,
                                    .qty = 300,
                                    .price = 1'000'100,
                                    .kind = 'L',
-                                   .tif = 'I'};
+                                   .tif = 'I',
+                                   .display = 0x0A0B0C0D,
+                                   .post_only = 'Y',
+                                   .self_match = 'R'};
     EXPECT_EQ(feed::decode<net::EnterOrder>(wire.data()), expected);
     EXPECT_EQ(bytes_of(expected), wire.bytes());
 }
@@ -134,7 +141,7 @@ TEST(Protocol, CancelledReplacedAndRejectedLayouts) {
 }
 
 TEST(Protocol, TheTypeByteDecidesTheSize) {
-    EXPECT_EQ(net::request_size('O'), 22U);
+    EXPECT_EQ(net::request_size('O'), 28U);
     EXPECT_EQ(net::request_size('U'), 17U);
     EXPECT_EQ(net::request_size('X'), 9U);
     EXPECT_EQ(net::response_size('A'), 38U);
@@ -190,6 +197,49 @@ TEST(Protocol, AnEnterOrderBecomesTheEnginesRequest) {
     ioc.tif = 'I';
     ASSERT_TRUE(net::to_engine(ioc, 17, out));
     EXPECT_EQ(out.tif, engine::TimeInForce::ImmediateOrCancel);
+}
+
+TEST(Protocol, TheInstructionsOfAnEnterOrderReachTheEngine) {
+    net::EnterOrder m{.token = 9, .locate = 4, .qty = 250, .price = 1'000'000};
+    engine::NewOrder out;
+    ASSERT_TRUE(net::to_engine(m, 17, out));
+    EXPECT_EQ(out.display, 0U);
+    EXPECT_FALSE(out.post_only);
+    EXPECT_EQ(out.self_match, engine::SelfMatch::Allow);
+
+    m.display = 100;
+    m.post_only = 'Y';
+    const std::pair<char, engine::SelfMatch> modes[] = {
+        {'N', engine::SelfMatch::Allow},
+        {'I', engine::SelfMatch::CancelIncoming},
+        {'R', engine::SelfMatch::CancelResting},
+        {'B', engine::SelfMatch::CancelBoth},
+    };
+    for (const auto& [byte, mode] : modes) {
+        m.self_match = byte;
+        ASSERT_TRUE(net::to_engine(m, 17, out)) << byte;
+        EXPECT_EQ(out.display, 100U);
+        EXPECT_TRUE(out.post_only);
+        EXPECT_EQ(out.self_match, mode) << byte;
+        // And back: what the load generator sends for an engine request.
+        EXPECT_EQ(net::to_wire(mode), byte);
+    }
+}
+
+TEST(Protocol, AnInstructionByteThatDoesNotExistIsRefused) {
+    const engine::NewOrder untouched{.owner = 99, .token = 99};
+    for (const char bad : {'\0', 'y', 'X', ' ', '1'}) {
+        net::EnterOrder m{.token = 1, .locate = 1, .qty = 1, .price = 1};
+        m.post_only = bad;
+        engine::NewOrder out = untouched;
+        EXPECT_FALSE(net::to_engine(m, 1, out)) << "post-only " << static_cast<int>(bad);
+        EXPECT_EQ(out, untouched);
+
+        m.post_only = 'N';
+        m.self_match = bad;
+        EXPECT_FALSE(net::to_engine(m, 1, out)) << "self-match " << static_cast<int>(bad);
+        EXPECT_EQ(out, untouched);
+    }
 }
 
 TEST(Protocol, AKindOrTimeInForceThatDoesNotExistIsRefused) {
@@ -288,17 +338,20 @@ TEST(Protocol, EveryReasonHasItsOwnByte) {
     for (const engine::RejectReason r :
          {engine::RejectReason::ZeroQuantity, engine::RejectReason::ZeroPrice,
           engine::RejectReason::BadSide, engine::RejectReason::UnknownInstrument,
-          engine::RejectReason::UnknownOrder, engine::RejectReason::NotOwner}) {
+          engine::RejectReason::UnknownOrder, engine::RejectReason::NotOwner,
+          engine::RejectReason::BadInstruction, engine::RejectReason::WouldTrade}) {
         EXPECT_TRUE(rejects.insert(net::to_wire(r)).second);
     }
-    EXPECT_EQ(rejects.size(), 7U);
+    EXPECT_EQ(rejects.size(), 9U);
 
     std::set<char> cancels;
     for (const engine::CancelReason r :
          {engine::CancelReason::Requested, engine::CancelReason::ImmediateOrCancel,
-          engine::CancelReason::FillOrKill, engine::CancelReason::NoLiquidity}) {
+          engine::CancelReason::FillOrKill, engine::CancelReason::NoLiquidity,
+          engine::CancelReason::PostOnly, engine::CancelReason::SelfMatch}) {
         EXPECT_TRUE(cancels.insert(net::to_wire(r)).second);
     }
+    EXPECT_EQ(cancels.size(), 6U);
     EXPECT_EQ(net::to_wire(engine::CancelReason::Requested), 'U');
 
     EXPECT_EQ(net::to_wire(engine::TimeInForce::Day), 'D');

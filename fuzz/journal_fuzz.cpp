@@ -87,6 +87,8 @@ struct CallLog {
         hash = mix(mix(mix(hash, o.locate), static_cast<unsigned char>(o.side)), o.qty);
         hash = mix(mix(mix(hash, o.price), static_cast<unsigned char>(o.kind)),
                    static_cast<unsigned char>(o.tif));
+        hash = mix(mix(mix(hash, o.display), o.post_only ? 1U : 0U),
+                   static_cast<unsigned char>(o.self_match));
         note();
         return 1;
     }
@@ -238,11 +240,22 @@ void structured(std::span<const std::byte> bytes) {
                 order.price = in.u32();
                 order.kind = static_cast<engine::OrderKind>(in.byte());
                 order.tif = static_cast<engine::TimeInForce>(in.byte());
+                order.display = in.u32();
+                order.post_only = (in.byte() & 1U) != 0;
+                order.self_match = static_cast<engine::SelfMatch>(in.byte());
                 journaled.submit(order, in.u64());
-                state.orders.push_back(
-                    {order.locate,
-                     order.side,
-                     {order.token, order.owner, order.token, order.price, order.qty}});
+                state.orders.push_back({order.locate,
+                                        order.side,
+                                        {.id = order.token,
+                                         .owner = order.owner,
+                                         .token = order.token,
+                                         .price = order.price,
+                                         .qty = order.qty,
+                                         .hidden = order.display,
+                                         .display = order.qty,
+                                         .ref = order.token ^ order.price,
+                                         .post_only = order.post_only,
+                                         .self_match = order.self_match}});
                 break;
             }
             case 2: {
@@ -257,6 +270,7 @@ void structured(std::span<const std::byte> bytes) {
                 journaled.replace(owner, id, qty, in.u32(), in.u64());
                 state.counters.last_order_id = id;
                 state.stats.replaces = qty;
+                state.stats.self_matches = owner;
                 break;
             }
         }

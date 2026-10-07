@@ -97,6 +97,16 @@ TYPED_TEST(EngineDifferential, SameOutputWhenOneOwnerTradesWithItself) {
         {.seed = 32, .symbols = 1, .owners = 1, .target_live_orders = 60}, 20'000);
 }
 
+// Icebergs, post-only orders and self-match prevention, on a book small enough
+// that they keep running into each other.
+TYPED_TEST(EngineDifferential, SameOutputWhenOrdersCarryInstructions) {
+    for (std::uint64_t seed = 41; seed <= 46; ++seed) {
+        SCOPED_TRACE("seed " + std::to_string(seed));
+        expect_same_as_reference<TypeParam>(test::instructed_config(seed), 15'000);
+        ASSERT_FALSE(this->HasFatalFailure());
+    }
+}
+
 TYPED_TEST(EngineDifferential, SameOutputOnADeepBookWithManySymbols) {
     expect_same_as_reference<TypeParam>({.seed = 33,
                                          .symbols = 200,

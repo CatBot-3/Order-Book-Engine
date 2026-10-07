@@ -77,16 +77,31 @@ struct FlowRun {
                            .bad_per_million = 50'000};
 }
 
+// A busy market in which many orders carry instructions, and with few enough
+// owners that an order often meets another of its owner's.
+[[nodiscard]] inline gen::FlowConfig instructed_config(std::uint64_t seed) {
+    return gen::FlowConfig{.seed = seed,
+                           .symbols = 2,
+                           .owners = 3,
+                           .target_live_orders = 60,
+                           .bad_per_million = 30'000,
+                           .iceberg_per_million = 250'000,
+                           .post_only_per_million = 120'000,
+                           .self_match_per_million = 400'000};
+}
+
 // The flows the property tests run over. Between them they take every path
 // through the engine; EngineProperty.TheFlowsReachEveryPath checks that claim.
 [[nodiscard]] inline std::vector<gen::FlowConfig> property_configs() {
-    return {busy_config(1), busy_config(2),   busy_config(3),
-            busy_config(4), thin_config(101), thin_config(102)};
+    return {busy_config(1),         busy_config(2),         busy_config(3),
+            busy_config(4),         thin_config(101),       thin_config(102),
+            instructed_config(201), instructed_config(202), instructed_config(203)};
 }
 
 [[nodiscard]] inline std::string describe(const gen::FlowConfig& cfg) {
     return "seed " + std::to_string(cfg.seed) + ", " + std::to_string(cfg.symbols) +
-           " symbols, target " + std::to_string(cfg.target_live_orders) + " resting orders";
+           " symbols, target " + std::to_string(cfg.target_live_orders) + " resting orders" +
+           (cfg.self_match_per_million != 0 ? ", with instructions" : "");
 }
 
 }  // namespace obe::test

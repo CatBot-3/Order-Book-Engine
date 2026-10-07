@@ -48,7 +48,12 @@ namespace obe::journal {
 
 inline constexpr std::size_t kFileHeaderSize = 16;
 inline constexpr std::size_t kRecordHeaderSize = 14;
-inline constexpr std::uint16_t kVersion = 1;
+// Version 2 added the three instructions to the submit record. A journal is a
+// record of what one version of the engine was asked, and replays to the same
+// state only on that version (docs/design.md, "Decisions that are open to
+// change", item 15), so an
+// older file is refused by its header and not converted.
+inline constexpr std::uint16_t kVersion = 2;
 inline constexpr char kMagic[4] = {'O', 'B', 'E', 'J'};
 
 // 'I': an instrument is opened.
@@ -86,6 +91,9 @@ struct Submit {
     Price price = 0;
     char kind = 0;  // the byte behind engine::OrderKind
     char tif = 0;   // the byte behind engine::TimeInForce
+    Qty display = 0;
+    char post_only = 0;   // 0 or 1
+    char self_match = 0;  // the byte behind engine::SelfMatch
 
     [[nodiscard]] constexpr char type() const noexcept { return kType; }
     template <class Self, class V>
@@ -99,6 +107,9 @@ struct Submit {
         v.u32(m.price);
         v.ch(m.kind);
         v.ch(m.tif);
+        v.u32(m.display);
+        v.ch(m.post_only);
+        v.ch(m.self_match);
     }
     friend bool operator==(const Submit&, const Submit&) = default;
 
@@ -111,17 +122,24 @@ struct Submit {
                 .qty = order.qty,
                 .price = order.price,
                 .kind = static_cast<char>(order.kind),
-                .tif = static_cast<char>(order.tif)};
+                .tif = static_cast<char>(order.tif),
+                .display = order.display,
+                .post_only = order.post_only ? char{1} : char{0},
+                .self_match = static_cast<char>(order.self_match)};
     }
     [[nodiscard]] constexpr engine::NewOrder order() const noexcept {
-        return {.owner = owner,
-                .token = token,
-                .locate = locate,
-                .side = side,
-                .qty = qty,
-                .price = price,
-                .kind = static_cast<engine::OrderKind>(static_cast<std::uint8_t>(kind)),
-                .tif = static_cast<engine::TimeInForce>(static_cast<std::uint8_t>(tif))};
+        return {
+            .owner = owner,
+            .token = token,
+            .locate = locate,
+            .side = side,
+            .qty = qty,
+            .price = price,
+            .kind = static_cast<engine::OrderKind>(static_cast<std::uint8_t>(kind)),
+            .tif = static_cast<engine::TimeInForce>(static_cast<std::uint8_t>(tif)),
+            .display = display,
+            .post_only = post_only != 0,
+            .self_match = static_cast<engine::SelfMatch>(static_cast<std::uint8_t>(self_match))};
     }
 };
 
@@ -171,7 +189,7 @@ inline constexpr std::size_t kSubmitSize = feed::kWireSize<Submit>;
 inline constexpr std::size_t kCancelSize = feed::kWireSize<Cancel>;
 inline constexpr std::size_t kReplaceSize = feed::kWireSize<Replace>;
 static_assert(kAddInstrumentSize == 1 + 8 + 2 + 8);
-static_assert(kSubmitSize == 1 + 8 + 4 + 8 + 2 + 1 + 4 + 4 + 1 + 1);
+static_assert(kSubmitSize == 1 + 8 + 4 + 8 + 2 + 1 + 4 + 4 + 1 + 1 + 4 + 1 + 1);
 static_assert(kCancelSize == 1 + 8 + 4 + 8);
 static_assert(kReplaceSize == 1 + 8 + 4 + 8 + 4 + 4);
 

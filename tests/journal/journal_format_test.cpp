@@ -109,7 +109,7 @@ TEST(JournalRecords, EachSurvivesEncodingExactly) {
 
 TEST(JournalRecords, EachTypeHasItsOwnSizeAndUnknownTypesHaveNone) {
     EXPECT_EQ(journal::body_size('I'), 19U);
-    EXPECT_EQ(journal::body_size('S'), 34U);
+    EXPECT_EQ(journal::body_size('S'), 40U);
     EXPECT_EQ(journal::body_size('X'), 21U);
     EXPECT_EQ(journal::body_size('U'), 29U);
     for (int c = 0; c < 256; ++c) {
@@ -157,9 +157,9 @@ TEST(JournalWriter, StartsAFileWithItsHeader) {
     EXPECT_TRUE(out.empty()) << "nothing is handed over before a flush";
     EXPECT_EQ(writer.pending(), 16U);
     writer.flush();
-    // "OBEJ", version 1, zero, first sequence number 1.
+    // "OBEJ", version 2, zero, first sequence number 1.
     const std::vector<std::byte> expected{
-        std::byte{'O'}, std::byte{'B'}, std::byte{'E'}, std::byte{'J'}, std::byte{0}, std::byte{1},
+        std::byte{'O'}, std::byte{'B'}, std::byte{'E'}, std::byte{'J'}, std::byte{0}, std::byte{2},
         std::byte{0},   std::byte{0},   std::byte{0},   std::byte{0},   std::byte{0}, std::byte{0},
         std::byte{0},   std::byte{0},   std::byte{0},   std::byte{1}};
     EXPECT_EQ(out, expected);
@@ -202,7 +202,7 @@ TEST(JournalWriter, NumbersRecordsInOrderAndCountsWhatItHandsOver) {
     EXPECT_EQ(writer.records(), 3U);
     EXPECT_EQ(writer.next_sequence(), 4U);
     EXPECT_TRUE(out.empty());
-    const std::size_t expected = 16 + (14 + 21) + (14 + 29) + (14 + 34);
+    const std::size_t expected = 16 + (14 + 21) + (14 + 29) + (14 + 40);
     EXPECT_EQ(writer.pending(), expected);
     writer.flush();
     EXPECT_EQ(out.size(), expected);
@@ -334,10 +334,15 @@ TEST(JournalReader, SomethingThatIsNotAJournalIsRefused) {
     EXPECT_EQ(read_all(bytes_of("PK")).status, ReadStatus::BadHeader);
     EXPECT_EQ(read_all(bytes_of("this is a text file, not a journal")).status,
               ReadStatus::BadHeader);
-    Sample s = sample(3);
-    s.bytes[5] = std::byte{2};  // a version this code does not know
-    EXPECT_EQ(read_all(s.bytes).status, ReadStatus::BadHeader);
-    EXPECT_EQ(read_all(s.bytes).records, 0U);
+    // A version this code does not read: the one before (its submit records
+    // were shorter) and one that does not exist yet.
+    for (const std::uint8_t version : {std::uint8_t{1}, std::uint8_t{3}}) {
+        Sample s = sample(3);
+        ASSERT_EQ(s.bytes[5], std::byte{2}) << "the current version";
+        s.bytes[5] = std::byte{version};
+        EXPECT_EQ(read_all(s.bytes).status, ReadStatus::BadHeader);
+        EXPECT_EQ(read_all(s.bytes).records, 0U);
+    }
 }
 
 TEST(JournalReader, AJournalCutOffAnywhereIsATornTailAtTheLastWholeRecord) {

@@ -23,6 +23,7 @@
 // The judges, all labelled needs-your-code until this file is written:
 //
 //   tests/engine/engine_scenario_test.cpp      every order type and edge case
+//   tests/engine/instructions_test.cpp         post-only, icebergs, self-match prevention
 //   tests/engine/engine_property_test.cpp      invariants over seeded random flow
 //   tests/engine/round_trip_test.cpp           criterion 7: your feed rebuilds your book
 //   tests/engine/engine_differential_test.cpp  identical output to the reference
@@ -34,7 +35,7 @@
 // meant to vary.
 //
 // Try writing the matching loop from the contract before reading the reference
-// engine. The reference is about 150 lines of logic and reading it first makes
+// engine. The reference is a few hundred lines of logic and reading it first makes
 // the exercise a transcription.
 //
 // Decisions to make:
@@ -95,6 +96,32 @@
 //     left in your design, and when do they happen? Run both engines under
 //     `perf stat -e page-faults` or count calls to operator new to check the
 //     answer, then put the result in the log.
+//
+//  9. The instructions (post-only, icebergs, self-match prevention).
+//     Read "Instructions" in concepts.hpp, and get the plain engine passing
+//     first: an order with no instruction must not pay for them, and
+//     tests/engine/instructions_test.cpp will tell you what is left.
+//     Things to settle before writing any of it:
+//       - An order now has two quantities (shown and hidden), a display size,
+//         a second number the market knows it by, and two instructions that
+//         stay with it. Which of those does the matching loop touch on every
+//         trade, and which only when something unusual happens? Where do the
+//         rare ones go so that the common path does not carry them?
+//       - A new slice of an iceberg goes to the back of its own level. With
+//         an intrusive list that is unlinking the head and linking a tail,
+//         with no allocation. What is the case where the order is both head
+//         and tail?
+//       - The slice takes the next id as its market reference, so the id
+//         counter and your id-to-order index move without an order arriving.
+//         What does cancel(owner, that_number) have to find there?
+//       - Fill-or-kill used to be a walk over level totals. Icebergs make it
+//         need a second total per level. Self-match prevention makes it
+//         depend on WHOSE orders are in a level and where, which no total
+//         can answer. When can you still answer from totals alone, and how
+//         do you keep the slow walk off the path of orders that asked for no
+//         prevention?
+//       - The reference removes a resting order in three places now (cancel,
+//         complete fill, self-match). In yours, is that one function?
 //
 // When this is written, bench/engine_bench compares it with the reference:
 //

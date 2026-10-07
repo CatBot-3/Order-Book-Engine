@@ -715,6 +715,88 @@ TYPED_TEST(Recovery, TheDigestSeesWhichSideAnOrderIsOn) {
     EXPECT_NE(buying.digest(), selling.digest());
 }
 
+// What an order carries besides its price and its displayed shares decides
+// what it does later: a reserve comes up slice by slice, a display size sets
+// how large the slices are and survives a replace, post-only and the
+// self-match mode act on the trades to come, and the market reference is what
+// the next execution is published under. Each pair of engines below differs
+// in exactly one of them.
+TYPED_TEST(Recovery, TheDigestSeesWhatAnOrderCarriesBesidesItsPriceAndShares) {
+    const auto resting = [](engine::NewOrder order) {
+        Small<TypeParam> s;
+        order.owner = 1;
+        order.token = 1;
+        order.locate = 1;
+        order.side = Side::Sell;
+        order.price = 10'100;
+        EXPECT_NE(s.r.engine->submit(order, s.now++), 0U);
+        const std::vector<engine::RestingOrder> orders =
+            test::orders_of(*s.r.engine, 1, Side::Sell);
+        EXPECT_EQ(orders.size(), 1U);
+        EXPECT_EQ(orders.empty() ? 0U : orders[0].qty, 100U) << "every case shows 100 shares";
+        return s.digest();
+    };
+    const std::uint64_t plain = resting({.qty = 100});
+
+    // 400 hidden against 300: the same hundred on show.
+    EXPECT_NE(resting({.qty = 500, .display = 100}), resting({.qty = 400, .display = 100}))
+        << "the reserve";
+    // A display size that hides nothing now, and will when the order grows.
+    EXPECT_NE(resting({.qty = 100, .display = 100}), plain) << "the display size";
+    EXPECT_NE(resting({.qty = 100, .display = 100}), resting({.qty = 100, .display = 150}))
+        << "the display size";
+    EXPECT_NE(resting({.qty = 100, .post_only = true}), plain) << "post-only";
+    EXPECT_NE(resting({.qty = 100, .self_match = engine::SelfMatch::CancelIncoming}), plain)
+        << "the self-match mode";
+    EXPECT_NE(resting({.qty = 100, .self_match = engine::SelfMatch::CancelResting}),
+              resting({.qty = 100, .self_match = engine::SelfMatch::CancelBoth}))
+        << "the self-match mode";
+}
+
+// An iceberg's new slice is published under the next order number. Two
+// engines do the same three things, a trade that brings up a slice and an
+// order that comes and goes, in the two possible orders: the same book, the
+// same totals, and a slice numbered 4 in one and 3 in the other.
+TYPED_TEST(Recovery, TheDigestSeesTheNumberAnIcebergsSliceIsKnownBy) {
+    const auto iceberg = [](Small<TypeParam>& s) {
+        ASSERT_EQ(s.r.engine->submit({.owner = 1,
+                                      .token = 1,
+                                      .locate = 1,
+                                      .side = Side::Sell,
+                                      .qty = 300,
+                                      .price = 10'100,
+                                      .display = 100},
+                                     s.now++),
+                  1U);
+    };
+    const auto trade = [](Small<TypeParam>& s) { s.rest(Side::Buy, 10'100, 100, 2, 7); };
+    const auto come_and_go = [](Small<TypeParam>& s) {
+        const OrderId id = s.rest(Side::Buy, 9'000, 5, 3, 9);
+        ASSERT_TRUE(s.r.engine->cancel(3, id, s.now++));
+    };
+
+    Small<TypeParam> a;
+    iceberg(a);
+    come_and_go(a);  // order 2
+    trade(a);        // order 3: the slice becomes 4
+    Small<TypeParam> b;
+    iceberg(b);
+    trade(b);        // order 2: the slice becomes 3
+    come_and_go(b);  // order 4
+
+    std::vector<engine::RestingOrder> in_a = test::orders_of(*a.r.engine, 1, Side::Sell);
+    std::vector<engine::RestingOrder> in_b = test::orders_of(*b.r.engine, 1, Side::Sell);
+    ASSERT_EQ(in_a.size(), 1U);
+    ASSERT_EQ(in_b.size(), 1U);
+    EXPECT_EQ(in_a[0].market_ref(), 4U);
+    EXPECT_EQ(in_b[0].market_ref(), 3U);
+    in_a[0].ref = 0;
+    in_b[0].ref = 0;
+    ASSERT_EQ(in_a, in_b) << "the two orders should differ in their market reference only";
+    ASSERT_EQ(a.r.engine->stats(), b.r.engine->stats());
+    EXPECT_NE(a.digest(), b.digest());
+}
+
 // The same book under another locate is another instrument's book.
 TYPED_TEST(Recovery, TheDigestSeesWhichInstrumentABookBelongsTo) {
     const auto with_book_on = [](Locate locate) {

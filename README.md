@@ -28,6 +28,7 @@ did not help.
 | 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; nothing measured yet |
 | 8 | Market-making simulator | fill model, metrics, two simple strategies and `mm_sim` done; the Avellaneda-Stoikov strategy is being written; not yet run on a real file |
 | 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; nothing measured yet |
+| 10 | Self-match prevention and more order types (stretch idea 2) | done in the reference engine: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot; the pooled engine has them to write |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -278,7 +279,17 @@ code. The full contract is in
    cancel and replace. A market order never rests. A fill-or-kill order is
    checked against the book before any trade is published, and trades
    completely or not at all.
-4. **Self-trading is allowed.** There are no auctions, halts or price bands.
+4. **Post-only** orders rest or do nothing: one that would trade on arrival is
+   cancelled, and a replace that would make one trade is refused.
+5. **Iceberg orders** show a part and hide the rest. The market data and the
+   level totals carry displayed shares only. When the displayed part is used
+   up the next slice appears at the back of the queue under a new order
+   reference, so nobody watching can tell it from a new order.
+6. **Self-match prevention is per order.** By default an owner's order can
+   trade with another of their own. An order can ask instead for the incoming
+   order to be cancelled, the resting one, or both, at the moment the two
+   would trade.
+7. There are no auctions, halts, price bands, stop orders or pegged orders.
 
 ## Results
 
@@ -317,7 +328,7 @@ number of connections and the CPUs each program was pinned to.
 | Unit | every decoder against bytes built at specification offsets; containers; histogram |
 | Golden | a hand-built byte stream with a hand-worked book |
 | Differential | the book against a naive oracle, update for update; each optimized book and the hand-written engine against their reference |
-| Property | long seeded random sequences against a `std::map` model; for the engine: never crossed, shares conserved, price-time order, determinism |
+| Property | long seeded random sequences against a `std::map` model; for the engine: never crossed, shares conserved, price-time order, determinism, on flows with and without icebergs, post-only orders and self-match prevention |
 | Round trip | the engine's published feed, through the feed handler, rebuilds the engine's book |
 | Concurrency | each queue: every item once, in order, intact, between two threads; the pipeline against the single-threaded replay; the seqlock against torn reads |
 | Network | the gateway over real loopback sockets: partial reads, mid-message disconnects, bad input, slow and paused clients; the feed with packets lost, repeated and reordered; the load generator's schedule against a server that stalls, in simulated time |

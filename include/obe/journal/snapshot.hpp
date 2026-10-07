@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <unordered_set>
@@ -36,7 +37,12 @@
 //   the instruments      which locates are open, and their symbols
 //   every resting order  id, owner, token, side, price and open shares, and
 //                        its place in the queue, which is kept by listing the
-//                        orders of each level oldest first
+//                        orders of each level oldest first. Also what only
+//                        some orders have: the shares an iceberg hides, its
+//                        display size and the reference the market currently
+//                        knows it by, and the instructions (post-only,
+//                        self-match prevention) that still bind an order
+//                        when a replace moves it
 //   the two counters     the last order id and the last match number. They
 //                        are in no order and no level, and without them the
 //                        restored engine would hand out ids that are already
@@ -57,13 +63,19 @@
 //    8  next journal sequence        u64
 //   16  last order id                u64
 //   24  last match number            u64
-//   32  the seven statistics         7 x u64, in the order of EngineStats
-//   88  number of instruments        u32
-//   92  number of orders             u32
-//   96  instruments                  each: locate u16, symbol 8 chars
+//   32  the eight statistics         8 x u64, in the order of EngineStats
+//   96  number of instruments        u32
+//  100  number of orders             u32
+//  104  instruments                  each: locate u16, symbol 8 chars
 //       orders                       each: locate u16, side 1, id u64,
-//                                    owner u32, token u64, price u32, qty u32
+//                                    owner u32, token u64, price u32,
+//                                    displayed u32, hidden u32, display size
+//                                    u32, market reference u64 (0: the id),
+//                                    post-only 1 (0 or 1), self-match 1
 //  end  CRC-32 of everything above   u32
+//
+// Version 2. Version 1 had no instructions; a file of another version is
+// refused, and recovery falls back on the journal.
 //
 // A snapshot is written whole and then checked whole. One that fails any
 // check is not used at all: unlike a journal, half a snapshot is worth
@@ -72,10 +84,13 @@
 namespace obe::journal {
 
 inline constexpr char kSnapshotMagic[4] = {'O', 'B', 'E', 'S'};
-inline constexpr std::uint16_t kSnapshotVersion = 1;
-inline constexpr std::size_t kSnapshotFixedSize = 96;
+inline constexpr std::uint16_t kSnapshotVersion = 2;
+inline constexpr std::size_t kSnapshotStats = 8;
+inline constexpr std::size_t kSnapshotFixedSize = 32 + 8 * kSnapshotStats + 8;
 inline constexpr std::size_t kSnapshotInstrumentSize = 2 + 8;
-inline constexpr std::size_t kSnapshotOrderSize = 2 + 1 + 8 + 4 + 8 + 4 + 4;
+inline constexpr std::size_t kSnapshotOrderSize = 2 + 1 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 8 + 1 + 1;
+// A statistic added to EngineStats has to be added to the file as well.
+static_assert(sizeof(engine::EngineStats) == 8 * kSnapshotStats);
 
 struct SnapshotInstrument {
     Locate locate = 0;
@@ -138,9 +153,12 @@ template <engine::Restorable Engine>
 // trusted completely afterwards, so a state is checked completely before:
 //
 //   every order is for an instrument in the state, on a real side, with a
-//   price and shares;
-//   no id appears twice, and none is above the last id the counter says was
-//   given out (the engine would give it out again);
+//   price and shares showing;
+//   only an iceberg hides shares, and it shows no more than its display size
+//   while it does;
+//   no id or market reference appears twice, and none is above the last id
+//   the counter says was given out (the engine would give it out again);
+//   the self-match instruction is one of the four the engine keeps;
 //   no book is locked or crossed.
 [[nodiscard]] inline bool plausible(const EngineState& state) {
     std::vector<bool> listed(std::size_t{1} << 16, false);
@@ -150,8 +168,10 @@ template <engine::Restorable Engine>
         }
         listed[instrument.locate] = true;
     }
+    // Order ids and market references come from one counter, so no number may
+    // serve twice in either role.
     std::unordered_set<OrderId> ids;
-    ids.reserve(state.orders.size());
+    ids.reserve(2 * state.orders.size());
     // The best bid and the best ask of each instrument, as they are met.
     std::vector<Price> best_bid(std::size_t{1} << 16, 0);
     std::vector<Price> best_ask(std::size_t{1} << 16, 0);
@@ -160,6 +180,22 @@ template <engine::Restorable Engine>
         if (!listed[entry.locate] || !engine::valid_side(entry.side) || order.qty == 0 ||
             order.price == 0 || order.id == 0 || order.id > state.counters.last_order_id ||
             !ids.insert(order.id).second) {
+            return false;
+        }
+        if (order.hidden != 0 && (order.display == 0 || order.qty > order.display)) {
+            return false;
+        }
+        if (order.open() > std::numeric_limits<Qty>::max()) {
+            return false;  // an order's open shares never exceed what it was entered for
+        }
+        if (order.ref != 0 &&
+            (order.ref > state.counters.last_order_id || !ids.insert(order.ref).second)) {
+            return false;
+        }
+        if (order.self_match != engine::SelfMatch::Allow &&
+            order.self_match != engine::SelfMatch::CancelIncoming &&
+            order.self_match != engine::SelfMatch::CancelResting &&
+            order.self_match != engine::SelfMatch::CancelBoth) {
             return false;
         }
         if (entry.side == Side::Buy) {
@@ -217,15 +253,17 @@ template <engine::Restorable Engine>
     feed::store_be<std::uint64_t>(p + 8, state.next_sequence);
     feed::store_be<std::uint64_t>(p + 16, state.counters.last_order_id);
     feed::store_be<std::uint64_t>(p + 24, state.counters.last_match_number);
-    const std::uint64_t stats[7] = {state.stats.accepted,       state.stats.rejected,
-                                    state.stats.cancels,        state.stats.replaces,
-                                    state.stats.trades,         state.stats.traded_shares,
-                                    state.stats.unfilled_shares};
-    for (std::size_t i = 0; i < 7; ++i) {
+    const std::uint64_t stats[kSnapshotStats] = {
+        state.stats.accepted,        state.stats.rejected,    state.stats.cancels,
+        state.stats.replaces,        state.stats.trades,      state.stats.traded_shares,
+        state.stats.unfilled_shares, state.stats.self_matches};
+    for (std::size_t i = 0; i < kSnapshotStats; ++i) {
         feed::store_be<std::uint64_t>(p + 32 + 8 * i, stats[i]);
     }
-    feed::store_be<std::uint32_t>(p + 88, static_cast<std::uint32_t>(state.instruments.size()));
-    feed::store_be<std::uint32_t>(p + 92, static_cast<std::uint32_t>(state.orders.size()));
+    feed::store_be<std::uint32_t>(p + kSnapshotFixedSize - 8,
+                                  static_cast<std::uint32_t>(state.instruments.size()));
+    feed::store_be<std::uint32_t>(p + kSnapshotFixedSize - 4,
+                                  static_cast<std::uint32_t>(state.orders.size()));
     p += kSnapshotFixedSize;
     for (const SnapshotInstrument& instrument : state.instruments) {
         feed::store_be<std::uint16_t>(p, instrument.locate);
@@ -240,6 +278,11 @@ template <engine::Restorable Engine>
         feed::store_be<std::uint64_t>(p + 15, entry.order.token);
         feed::store_be<std::uint32_t>(p + 23, entry.order.price);
         feed::store_be<std::uint32_t>(p + 27, entry.order.qty);
+        feed::store_be<std::uint32_t>(p + 31, entry.order.hidden);
+        feed::store_be<std::uint32_t>(p + 35, entry.order.display);
+        feed::store_be<std::uint64_t>(p + 39, entry.order.ref);
+        p[47] = entry.order.post_only ? std::byte{1} : std::byte{0};
+        p[48] = static_cast<std::byte>(entry.order.self_match);
         p += kSnapshotOrderSize;
     }
     const std::uint32_t crc = util::crc32({out.data(), out.size() - 4});
@@ -265,8 +308,8 @@ template <engine::Restorable Engine>
         feed::load_be<std::uint16_t>(p + 6) != 0) {
         return std::nullopt;
     }
-    const std::size_t instruments = feed::load_be<std::uint32_t>(p + 88);
-    const std::size_t orders = feed::load_be<std::uint32_t>(p + 92);
+    const std::size_t instruments = feed::load_be<std::uint32_t>(p + kSnapshotFixedSize - 8);
+    const std::size_t orders = feed::load_be<std::uint32_t>(p + kSnapshotFixedSize - 4);
     // The counts are checked against the length before anything is sized by
     // them: a damaged count must not become a four-gigabyte allocation.
     const std::size_t payload = bytes.size() - kSnapshotFixedSize - 4;
@@ -282,11 +325,11 @@ template <engine::Restorable Engine>
     state.next_sequence = feed::load_be<std::uint64_t>(p + 8);
     state.counters.last_order_id = feed::load_be<std::uint64_t>(p + 16);
     state.counters.last_match_number = feed::load_be<std::uint64_t>(p + 24);
-    std::uint64_t stats[7];
-    for (std::size_t i = 0; i < 7; ++i) {
+    std::uint64_t stats[kSnapshotStats];
+    for (std::size_t i = 0; i < kSnapshotStats; ++i) {
         stats[i] = feed::load_be<std::uint64_t>(p + 32 + 8 * i);
     }
-    state.stats = {stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6]};
+    state.stats = {stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6], stats[7]};
     p += kSnapshotFixedSize;
     state.instruments.resize(instruments);
     for (SnapshotInstrument& instrument : state.instruments) {
@@ -303,6 +346,17 @@ template <engine::Restorable Engine>
         entry.order.token = feed::load_be<std::uint64_t>(p + 15);
         entry.order.price = feed::load_be<std::uint32_t>(p + 23);
         entry.order.qty = feed::load_be<std::uint32_t>(p + 27);
+        entry.order.hidden = feed::load_be<std::uint32_t>(p + 31);
+        entry.order.display = feed::load_be<std::uint32_t>(p + 35);
+        entry.order.ref = feed::load_be<std::uint64_t>(p + 39);
+        if (p[47] > std::byte{1}) {
+            // Only 0 and 1 are written. Anything else is not a file this code
+            // wrote, and reading it as "true" would decode two files to one
+            // state.
+            return std::nullopt;
+        }
+        entry.order.post_only = p[47] == std::byte{1};
+        entry.order.self_match = static_cast<engine::SelfMatch>(p[48]);
         p += kSnapshotOrderSize;
     }
     return state;

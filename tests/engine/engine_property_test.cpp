@@ -15,6 +15,7 @@
 #include "obe/engine/types.hpp"
 #include "obe/feed/messages.hpp"
 #include "obe/gen/order_flow.hpp"
+#include "obe/gen/rng.hpp"
 #include "support/engine_harness.hpp"
 #include "support/flow_run.hpp"
 #include "support/naive_engine.hpp"
@@ -80,8 +81,14 @@ void check_side(const Engine& engine, Locate locate, Side side, std::set<OrderId
     // The orders, grouped by price in the same order, add up to the levels.
     std::vector<Level> summed;
     for (const RestingOrder& o : orders) {
-        ASSERT_GT(o.qty, 0U) << "order " << o.id << " rests with no shares";
+        ASSERT_GT(o.qty, 0U) << "order " << o.id << " rests with nothing showing";
         ASSERT_TRUE(seen.insert(o.id).second) << "order " << o.id << " appears twice";
+        if (o.hidden != 0) {
+            // Only an iceberg hides shares, and it never shows more than its
+            // display size while it has some hidden.
+            ASSERT_GT(o.display, 0U) << "order " << o.id << " hides shares without being told to";
+            ASSERT_LE(o.qty, o.display) << "order " << o.id << " shows more than it may";
+        }
         if (summed.empty() || summed.back().price != o.price) {
             summed.push_back(Level{o.price, 0});
         }
@@ -143,11 +150,23 @@ struct Ledger {
     std::uint64_t shrunk = 0;
     std::uint64_t retired = 0;  // shares of an order a replace took out to re-enter
     OrderId last_id = 0;
+    // Each new slice of an iceberg takes an id for its market-data reference,
+    // so a flow with icebergs skips ids. Without them ids are consecutive.
+    bool ids_may_skip = false;
     std::optional<Executed> half;  // the Added side of a trade, awaiting its other side
 
+    void next_id(OrderId id) {
+        if (ids_may_skip) {
+            ASSERT_GT(id, last_id) << "ids must increase";
+        } else {
+            ASSERT_EQ(id, last_id + 1) << "ids must count up without gaps";
+        }
+        last_id = id;
+    }
+
     void operator()(const Accepted& r) {
-        ASSERT_EQ(r.order_id, last_id + 1) << "ids must count up without gaps";
-        last_id = r.order_id;
+        next_id(r.order_id);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
         ASSERT_GT(r.qty, 0U);
         ASSERT_FALSE(half) << "a trade was reported from one side only";
         open[r.order_id] = Open{r.owner, r.token, r.qty};
@@ -204,8 +223,8 @@ struct Ledger {
             shrunk += it->second.qty - r.qty;
             it->second.qty = r.qty;
         } else {
-            ASSERT_EQ(r.new_id, last_id + 1);
-            last_id = r.new_id;
+            next_id(r.new_id);
+            ASSERT_FALSE(::testing::Test::HasFatalFailure());
             const Open old = it->second;
             retired += old.qty;
             open.erase(it);
@@ -223,6 +242,7 @@ TYPED_TEST(EngineProperty, SharesAreConserved) {
         run.run(kCommands);
 
         Ledger ledger;
+        ledger.ids_may_skip = cfg.iceberg_per_million != 0;
         for (const Report& report : run.log.all) {
             std::visit(ledger, report);
             ASSERT_FALSE(this->HasFatalFailure());
@@ -247,7 +267,8 @@ TYPED_TEST(EngineProperty, SharesAreConserved) {
                     in_book[o.id] = o.qty;
                     const auto it = ledger.open.find(o.id);
                     ASSERT_NE(it, ledger.open.end()) << "order " << o.id << " rests unreported";
-                    EXPECT_EQ(it->second.qty, o.qty);
+                    // The owner is told about every open share, shown or not.
+                    EXPECT_EQ(it->second.qty, o.open());
                     EXPECT_EQ(it->second.owner, o.owner);
                     EXPECT_EQ(it->second.token, o.token);
                 }
@@ -281,10 +302,18 @@ struct PublicBook {
     std::uint64_t clock = 0;
     std::uint64_t last_match = 0;
     OrderId last_ref = 0;
+    // An order that trades through icebergs on its way in rests under its own
+    // id, which is older than the references their new slices took meanwhile.
+    // So with icebergs about, references are unique and not always rising.
+    bool refs_may_fall = false;
+    std::set<OrderId> used;  // every reference ever shown
 
     void show(OrderId ref, Locate locate, Side side, Price price, Qty qty) {
-        ASSERT_GT(ref, last_ref) << "reference numbers must increase";
+        if (!refs_may_fall) {
+            ASSERT_GT(ref, last_ref) << "reference numbers must increase";
+        }
         last_ref = ref;
+        ASSERT_TRUE(used.insert(ref).second) << "reference " << ref << " was used before";
         ASSERT_GT(qty, 0U);
         ASSERT_TRUE(orders.emplace(ref, Shown{locate, side, price, qty, ++clock}).second);
     }
@@ -347,6 +376,7 @@ TYPED_TEST(EngineProperty, TradesFollowPriceThenTimeAsSeenFromTheFeed) {
         run.run(kCommands);
 
         PublicBook market;
+        market.refs_may_fall = cfg.iceberg_per_million != 0;
         std::size_t index = 0;
         for (const MdMessage& message : run.messages.all) {
             std::visit(market, message);
@@ -440,6 +470,98 @@ TYPED_TEST(EngineProperty, AgreesWithTheOracleOnADeepBook) {
                                      2 * kCommands);
 }
 
+// Fill-or-kill is where the three instructions meet: whether such an order
+// can be filled depends on hidden shares and on whose orders are where in
+// each queue (docs/design.md, section 8.6). The engine under test has to work
+// that out before it trades; the oracle simply does the trades with its output
+// off and undoes them. The ordinary flows send few fill-or-kill orders, so
+// this one adds them: every few requests, the same extra order goes to both
+// engines, sized around what the book holds, in each prevention mode.
+TYPED_TEST(EngineProperty, FillOrKillAgreesWithTheOracleAmongInstructions) {
+    std::uint64_t filled = 0;
+    std::uint64_t killed = 0;
+    for (std::uint64_t seed = 301; seed <= 304; ++seed) {
+        const gen::FlowConfig cfg = test::instructed_config(seed);
+        SCOPED_TRACE(test::describe(cfg));
+        FlowRun<TypeParam> run(cfg);
+        FlowRun<test::NaiveEngineImpl> oracle(cfg);
+        gen::SplitMix64 rng(seed);
+        engine::Token token = engine::Token{1} << 40;  // clear of the generator's own
+
+        for (std::uint64_t i = 0; i < 4'000; ++i) {
+            ASSERT_EQ(run.step(), oracle.step()) << "at request " << i;
+            if (i % 3 != 0) {
+                continue;
+            }
+            const auto locate = static_cast<Locate>(1 + rng.below(cfg.symbols));
+            const Side side = rng.below(2) == 0 ? Side::Buy : Side::Sell;
+            const Side other = side == Side::Buy ? Side::Sell : Side::Buy;
+            // Around the size of the first few levels it would trade with, so
+            // that it is often just fillable and often just not.
+            std::uint64_t near = 0;
+            Price limit = 0;
+            int levels = 0;
+            for (const RestingOrder& order : test::orders_of(*oracle.engine, locate, other)) {
+                if (order.price != limit) {
+                    if (++levels > 3) {
+                        break;
+                    }
+                    limit = order.price;
+                }
+                near += order.open();
+            }
+            if (near == 0) {
+                continue;
+            }
+            const engine::NewOrder order{
+                .owner = static_cast<engine::OwnerId>(1 + rng.below(cfg.owners)),
+                .token = ++token,
+                .locate = locate,
+                .side = side,
+                .qty = static_cast<Qty>(1 + rng.below(near + near / 4)),
+                .price = limit,
+                .tif = engine::TimeInForce::FillOrKill,
+                .self_match = static_cast<engine::SelfMatch>(rng.below(4))};
+            const Nanos now = run.flow.now();
+            const std::size_t reports_before = run.log.all.size();
+            const std::size_t messages_before = run.messages.all.size();
+            run.engine->submit(order, now);
+            oracle.engine->submit(order, now);
+
+            ASSERT_EQ(run.log.all.size(), oracle.log.all.size()) << "after request " << i;
+            for (std::size_t r = reports_before; r < run.log.all.size(); ++r) {
+                ASSERT_EQ(run.log.all[r], oracle.log.all[r])
+                    << "report " << r << " of a fill-or-kill for " << order.qty << " after request "
+                    << i;
+            }
+            ASSERT_EQ(run.messages.all.size(), oracle.messages.all.size());
+            for (std::size_t m = messages_before; m < run.messages.all.size(); ++m) {
+                ASSERT_EQ(run.messages.all[m], oracle.messages.all[m]) << "after request " << i;
+            }
+            // All or nothing, whichever it was.
+            const Report& last = run.log.all.back();
+            const Cancelled* cancel = std::get_if<Cancelled>(&last);
+            if (cancel != nullptr && cancel->token == order.token) {
+                ASSERT_EQ(cancel->reason, engine::CancelReason::FillOrKill);
+                ASSERT_EQ(cancel->qty, order.qty) << "killed whole";
+                ASSERT_EQ(run.log.all.size(), reports_before + 2) << "and nothing else happened";
+                ASSERT_EQ(run.messages.all.size(), messages_before);
+                ++killed;
+            } else {
+                const Executed* fill = std::get_if<Executed>(&last);
+                ASSERT_NE(fill, nullptr);
+                ASSERT_EQ(fill->token, order.token);
+                ASSERT_EQ(fill->leaves, 0U) << "filled whole";
+                ++filled;
+            }
+        }
+        EXPECT_EQ(run.engine->stats(), oracle.engine->stats());
+    }
+    // Both outcomes, often, or the comparison above proved little.
+    EXPECT_GT(filled, 500U);
+    EXPECT_GT(killed, 500U);
+}
+
 // --- The tests above are only as good as the flow ----------------------------
 
 TYPED_TEST(EngineProperty, TheFlowsReachEveryPath) {
@@ -451,10 +573,63 @@ TYPED_TEST(EngineProperty, TheFlowsReachEveryPath) {
     std::uint64_t complete = 0;
     std::map<char, std::uint64_t> messages;
     std::string trace;
+    // The instructions.
+    std::uint64_t replenished = 0;          // new slices of icebergs
+    std::uint64_t stopped_resting = 0;      // resting orders cancelled by prevention
+    std::uint64_t stopped_incoming = 0;     // incoming orders stopped by prevention
+    std::uint64_t post_only_cancelled = 0;  // post-only orders that would have traded
+    std::uint64_t post_only_asked = 0;
+    std::uint64_t hidden_cut = 0;  // in-place replaces that the market did not hear of
 
     for (const gen::FlowConfig& cfg : test::property_configs()) {
         FlowRun<TypeParam> run(cfg);
-        run.run(kCommands);
+        std::unordered_map<OrderId, Qty> last_open;  // open shares of each order, by the reports
+        for (std::uint64_t i = 0; i < kCommands; ++i) {
+            const std::size_t reports_before = run.log.all.size();
+            const std::size_t messages_before = run.messages.all.size();
+            const gen::Command c = run.step();
+            if (c.kind == gen::CommandKind::New && c.order.post_only) {
+                ++post_only_asked;
+            }
+            // A kept-priority replace that made the order smaller and told the
+            // market nothing took all of it from hidden shares.
+            if (c.kind == gen::CommandKind::Replace && run.log.all.size() == reports_before + 1 &&
+                run.messages.all.size() == messages_before) {
+                const Replaced* r = std::get_if<Replaced>(&run.log.all.back());
+                if (r != nullptr && r->kept_priority && r->qty < last_open[r->old_id]) {
+                    ++hidden_cut;
+                }
+            }
+            for (std::size_t k = reports_before; k < run.log.all.size(); ++k) {
+                if (const Accepted* a = std::get_if<Accepted>(&run.log.all[k])) {
+                    last_open[a->order_id] = a->qty;
+                } else if (const Executed* e = std::get_if<Executed>(&run.log.all[k])) {
+                    last_open[e->order_id] = e->leaves;
+                } else if (const Replaced* r = std::get_if<Replaced>(&run.log.all[k])) {
+                    last_open[r->new_id] = r->qty;
+                } else if (const Cancelled* x = std::get_if<Cancelled>(&run.log.all[k])) {
+                    if (x->reason == engine::CancelReason::SelfMatch) {
+                        const bool is_incoming =
+                            c.kind == gen::CommandKind::New && x->token == c.order.token;
+                        ++(is_incoming ? stopped_incoming : stopped_resting);
+                    } else if (x->reason == engine::CancelReason::PostOnly) {
+                        ++post_only_cancelled;
+                    }
+                }
+            }
+        }
+        // An 'A' whose reference no order was accepted or replaced under is a
+        // new slice of an iceberg.
+        std::set<OrderId> own_ids;
+        for (const Accepted& a : run.log.template of<Accepted>()) {
+            own_ids.insert(a.order_id);
+        }
+        for (const Replaced& r : run.log.template of<Replaced>()) {
+            own_ids.insert(r.new_id);
+        }
+        for (const feed::AddOrder& m : run.messages.template of<feed::AddOrder>()) {
+            replenished += own_ids.contains(m.order_ref) ? 0U : 1U;
+        }
         for (const Rejected& r : run.log.template of<Rejected>()) {
             rejects.insert(r.reason);
         }
@@ -477,8 +652,14 @@ TYPED_TEST(EngineProperty, TheFlowsReachEveryPath) {
         trace += '|';
     }
 
-    EXPECT_EQ(rejects.size(), 6U) << "every reject reason should occur";
-    EXPECT_EQ(cancels.size(), 4U) << "every cancel reason should occur";
+    EXPECT_EQ(rejects.size(), 8U) << "every reject reason should occur";
+    EXPECT_EQ(cancels.size(), 6U) << "every cancel reason should occur";
+    EXPECT_GT(replenished, 500U) << "icebergs should be traded through";
+    EXPECT_GT(stopped_resting, 80U) << "self-match prevention should cancel resting orders";
+    EXPECT_GT(stopped_incoming, 40U) << "self-match prevention should stop incoming orders";
+    EXPECT_GT(post_only_cancelled, 25U);
+    EXPECT_GT(post_only_asked, 4 * post_only_cancelled) << "most post-only orders should rest";
+    EXPECT_GT(hidden_cut, 60U) << "icebergs should be reduced in place";
     EXPECT_GT(kept, 200U);
     EXPECT_GT(moved, 200U);
     EXPECT_GT(partial, 200U);

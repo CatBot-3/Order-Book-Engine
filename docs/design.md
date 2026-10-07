@@ -254,7 +254,7 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Differential | same file | `BookManager` against `NaiveBook`, update for update |
 | Differential | `tests/book/differential_test.cpp`, `scripts/diff_books.sh` | each optimized book against the reference book, security by security |
 | Integration | `ctest` entries in `tests/CMakeLists.txt` | the real apps on a generated file, against the independent Python counter |
-| Engine scenario | `tests/engine/engine_scenario_test.cpp` | every order type and every edge of the engine contract: reports, market data and the book left behind |
+| Engine scenario | `tests/engine/engine_scenario_test.cpp`, `instructions_test.cpp` | every order type, every instruction and every edge of the engine contract: reports, market data and the book left behind |
 | Engine property | `tests/engine/engine_property_test.cpp` | never crossed, shares conserved, price-time order, determinism, and agreement with an oracle, over seeded random flow |
 | Round trip | `tests/engine/round_trip_test.cpp`, `scripts/flow_round_trip.sh` | the engine's feed, through the feed handler, rebuilds the engine's book |
 | Engine differential | `tests/engine/engine_differential_test.cpp`, `scripts/diff_engines.sh` | the hand-written engine says exactly what the reference says |
@@ -299,7 +299,7 @@ bodies are left out until they are written.
 | Contiguous price levels (experiment 3) | `include/obe/book/vector_price_levels.hpp` | **to write** |
 | Pool (experiment 4, and the engine later) | `include/obe/util/pool.hpp` | **to write** |
 | Reference matching engine | `include/obe/engine/reference_engine.hpp` | written |
-| Matching engine (pooled, intrusive queues) | `include/obe/engine/matching_engine.hpp` | **to write** |
+| Matching engine (pooled, intrusive queues), including the instructions of section 8.6 | `include/obe/engine/matching_engine.hpp` | **to write** |
 | Mutex queue, spin channel, seqlock, pipeline | `include/obe/util/mutex_queue.hpp`, `spin_channel.hpp`, `seqlock.hpp`, `include/obe/pipeline/` | written |
 | Lock-free ring | `include/obe/util/spsc_ring.hpp` | **to write** |
 | Gateway, market-data publisher and receiver, load generator | `include/obe/net/`, `apps/` | written |
@@ -476,7 +476,7 @@ everything that reads a real day reads the engine's output.
 
 The engine never reads a clock. Every operation takes the time from the
 caller and stamps its output with it. It also assigns the order ids and match
-numbers itself, counting up from one. Together those make a run a pure
+numbers itself, counting up. Together those make a run a pure
 function of its requests, which is what the differential test and the
 before-and-after benchmark both rely on.
 
@@ -501,7 +501,7 @@ are design decisions and not arithmetic:
 4. **Fill-or-kill is decided before the first trade.** A trade cannot be
    taken back once it is published, so the engine first sums the resting
    shares at acceptable prices. Level totals make that a walk over levels, not
-   orders.
+   orders, for every order that asks for no self-match prevention.
 5. **A market order never rests.** With no price there is no level to put it
    on. What it cannot fill is cancelled, with a reason that says the book ran
    out.
@@ -509,10 +509,11 @@ are design decisions and not arithmetic:
    fixed order and the first failure is the one reported. The order of the
    checks is part of the contract only because two engines have to agree on
    it.
-7. **Self-trading is allowed.** An owner's order can trade with another of
-   their own. Preventing it is on the spec's stretch list.
+7. **Self-trading is allowed unless an order asks otherwise.** An owner's
+   order can trade with another of their own. An order can carry an
+   instruction that prevents it (section 8.6).
 
-Left out on purpose: auctions, halts, price bands, lot-size rules, hidden and
+Left out on purpose: auctions, halts, price bands, lot-size rules, stop and
 pegged orders. Every instrument trades continuously from the moment it is
 opened.
 
@@ -541,8 +542,8 @@ steady state.
 A matching engine that is subtly wrong still produces plausible output, so the
 tests look at it from several independent directions:
 
-1. **Scenarios** state, for each order type and edge, the exact reports, the
-   exact market data and the exact book afterwards.
+1. **Scenarios** state, for each order type, each instruction and each edge,
+   the exact reports, the exact market data and the exact book afterwards.
 2. **Properties** over seeded random flow are each checked from a different
    place: the book is never crossed (from the engine's own book), shares are
    conserved (from the reports alone), trades follow price then time (from the
@@ -556,8 +557,9 @@ tests look at it from several independent directions:
    through the run, not only at the end.
 5. **A test of the tests.** `TheFlowsReachEveryPath` fails if the random flows
    stop producing every reject reason, every cancel reason, both kinds of
-   replace, sweeps, and replaces that trade. Without it the properties could
-   pass on flow that never visits the hard cases.
+   replace, sweeps, replaces that trade, new slices of icebergs, and
+   self-match prevention stopping orders on both sides. Without it the
+   properties could pass on flow that never visits the hard cases.
 6. **The differential test** holds the hand-written engine to the reference's
    output: market data byte for byte, reports one by one.
 
@@ -567,7 +569,19 @@ tests look at it from several independent directions:
 takes a random walk; most orders are placed a few ticks behind it, a minority
 reach across it, and cancels and replaces pick a random resting order. The
 number of resting orders hovers around a target. A small share of requests is
-wrong on purpose, to exercise the rejects.
+wrong on purpose, to exercise the rejects. Three rates, all zero by default,
+give orders the instructions of section 8.6; with all three at zero a seed
+produces exactly the requests it always did.
+
+A seed means the same requests on every compiler, and that had to be made
+true. Two random draws written as two arguments of one call are made in an
+order the language leaves to the compiler, and GCC and Clang choose
+differently: for a while the same seed gave one flow under GCC and another
+under Clang, and nothing noticed, because no test compared a flow with
+anything but itself. The draws are now in statements of their own, and a
+test pins the hash of a flow to a number
+(`tests/gen/order_flow_test.cpp`). A tape recorded by one build can be
+compared with one recorded by another only since then.
 
 It learns which orders are resting the way a participant would: it is a report
 sink, and whoever runs the engine routes the reports to it. That is also a
@@ -583,6 +597,88 @@ correlation between symbols, and executions are a larger share of the messages
 than on a real day (`itch_stats` shows the mix of any file). Numbers measured
 on it compare one build of this code with another. They say nothing about
 Nasdaq.
+
+### 8.6 Instructions: post-only, icebergs, self-match prevention
+
+Three instructions can ride on an order (`NewOrder::post_only`, `display`,
+`self_match`). They are the second of the spec's stretch ideas. The exact
+rules are under "Instructions" in `concepts.hpp`; what follows is why each is
+shaped as it is.
+
+**Post-only** means "rest, or do nothing". An order that would trade on
+arrival is cancelled. It exists because of how venues charge: a resting order
+is usually paid a rebate and an arriving one pays a fee, so a participant
+quoting for the rebate wants a guarantee that an order never crosses because
+the market moved while it was on the wire.
+
+1. It is Accepted and then Cancelled, not Rejected. It was a valid order that
+   the book had no room for, like a fill-or-kill that is killed, and it uses
+   an id. Rejected is kept for requests that are wrong in themselves.
+2. A replace that would make a post-only order trade is refused and the order
+   stays where it was. The alternative, cancelling the order, would turn an
+   attempt to improve a quote into losing it.
+3. "Would trade" is about price only. It is decided before any trade, so
+   self-match prevention, which is a rule about trades, has no say in it.
+
+**An iceberg** shows only part of itself. A large order displayed in full
+tells the market that somebody has a lot to do, and the price moves away
+before it is done.
+
+1. **The market sees displayed shares only**, in the feed and in the level
+   totals. The owner's reports count everything.
+2. **A new slice goes to the back of the queue.** When the displayed shares
+   are used up, the next slice has no claim on the place the old one earned.
+   If it kept the place, an iceberg would be a way to hold the front of a
+   queue with an unlimited amount while showing a little.
+3. **A new slice has a new name in the market data.** It takes the next id as
+   its order reference, as Nasdaq does, so that an observer cannot tell a new
+   slice from a new order. The order's own id, which the owner uses and every
+   report carries, does not change. So an order now has two names, and ids are
+   no longer consecutive: this is the one place the instructions changed
+   something for orders that do not use them.
+4. **Hidden shares can be traded with.** An order larger than what a level
+   shows meets the same iceberg again, a slice at a time, each one a separate
+   trade behind everything else at that price. Fill-or-kill counts them.
+5. **Shrinking an iceberg takes from the hidden part first**, and the market
+   hears nothing until the displayed part shrinks.
+
+**Self-match prevention** stops an order trading with another order of the
+same owner. A firm running several strategies does not want them paying fees
+to trade with each other, and in most markets a trade with oneself is a
+regulatory problem: it prints volume that no change of ownership stands
+behind.
+
+1. **It acts at one moment**: when the order the incoming one would trade with
+   next belongs to the same owner. An order of the same owner further down the
+   book, never reached, changes nothing.
+2. **Three modes, and the incoming order chooses**: cancel the incoming order,
+   cancel the resting one and carry on, or cancel both. There is no "right"
+   one; which order a firm would sooner lose depends on which strategy sent
+   it.
+3. **The instruction stays with a resting order.** It applies again if a
+   replace sends that order across the book, which is otherwise a way round
+   the rule.
+4. **Fill-or-kill has to know in advance**, and this is where the three
+   instructions meet. Whether a fill-or-kill order can be filled now depends
+   on whose orders are in a level and in what order: hidden shares of an
+   iceberg that sits ahead of the owner's own order come back *behind* that
+   order, and an incoming order that stops at its own order never reaches
+   them. The reference engine answers by reasoning about each level. The test
+   oracle answers by doing the trades with its output switched off and then
+   undoing them. They are checked against each other on every fill-or-kill in
+   the random flows, which is the only reason to trust the reasoning.
+
+`instructions_test.cpp` has one hand-worked scenario per rule, run on the
+reference engine and on the oracle. The flows used by the property tests now
+include three in which a quarter of the resting orders are icebergs, an eighth
+are post-only, and two in five ask for prevention, with three owners so that
+orders keep meeting their owner's others. Every property is checked on them,
+and so are the journal and snapshot suites: an engine restored with icebergs
+in the middle of their slices must carry on exactly as the original.
+
+Not done: stop orders, pegged orders, minimum quantity, good-till-date,
+decrementing self-match modes, and prevention across related owners (a real
+venue matches on a firm or group identifier, not on one owner id).
 
 ## 9. Threads and queues (`include/obe/util`, `include/obe/pipeline`)
 
@@ -756,7 +852,10 @@ described by the same one-field-list-per-message scheme as the ITCH messages,
 so encode, decode and size cannot disagree, and the sizes are pinned by
 `static_assert`. What is left out is the session layer OUCH rides on (logins,
 heartbeats, sequence numbers, replay after a reconnect): a connection is the
-session.
+session. An Enter Order carries the three instructions of section 8.6 as a
+display size and two bytes; a byte that is not one of the defined values is
+refused by the gateway, like an unknown kind or time in force, because the
+engine has no way to represent it.
 
 **Framing.** TCP delivers a stream of bytes with no message boundaries. Here
 the type byte decides how long a message is. The consequence is that an unknown
@@ -1142,8 +1241,13 @@ record        14 bytes   crc (u32)   CRC-32 of everything after this field
               size bytes body: a type byte, then that record's fields
 ```
 
-Integers are big-endian, like every other format here. A submit is 34 bytes
-of body, so a request costs 48 bytes on disk.
+Integers are big-endian, like every other format here. A submit is 40 bytes
+of body, so a request costs 54 bytes on disk.
+
+The version is 2: the submit record grew when orders gained instructions
+(section 8.6). A version 1 file is refused by its header, not converted. A
+journal is a record of what one version of the engine was asked, and it
+replays to the same state only on that version (section 13, item 15).
 
 Why each field is there:
 
@@ -1237,6 +1341,7 @@ book:
 |---|---|
 | the open instruments and their symbols | |
 | every resting order: id, owner, token, side, price, open shares | |
+| what only some orders have: an iceberg's hidden shares, its display size and the reference the market currently knows it by; post-only and self-match instructions | a restored iceberg must show its next slice at the right moment and be cancelled under the name the market knows; the instructions still bind the order when a replace moves it |
 | the orders of each level listed oldest first | time priority is not a field of an order; it is the order's place in a queue |
 | the last order id and the last match number | they are in no order and no level, and without them the restored engine would give its next order an id that is already resting |
 | the running totals | so they carry on instead of restarting |
@@ -1415,6 +1520,26 @@ revisit.
     functions are a separate concept and not part of the engine contract, so
     that an engine is not required to expose its insides in order to be
     usable.
+20. **A killed post-only order is Accepted and then Cancelled.** Rejecting it
+    would be as defensible, and is what some venues do. Cancelling keeps
+    "rejected" meaning "the request was wrong in itself", and treats the
+    order like a fill-or-kill that found the book unsuitable.
+21. **An iceberg's slices take their references from the order-id counter.**
+    One counter, so a reference can never collide with an order id, at the
+    price of ids that skip. A separate counter for references would keep ids
+    consecutive and need the market data and the owners' reports to use
+    different number spaces.
+22. **Self-match prevention compares owner ids.** One owner, one identity. A
+    venue would compare a firm or group identifier carried on the order, so
+    that two traders of one firm are prevented from trading with each other.
+    That is a field and a comparison away, and waits for the gateway to have
+    a notion of who a connection belongs to.
+23. **An order that trades through icebergs rests under its own, older id.**
+    Its reference in the market data is then lower than the references the
+    new slices took meanwhile, so references are unique and not always
+    increasing. Giving every resting order a fresh reference at the moment it
+    rests would restore the order, and add a second name to every order for
+    the sake of a property nothing here relies on.
 
 ## 14. Known limits
 
@@ -1447,3 +1572,7 @@ revisit.
     somewhere else, written before a request is acknowledged.
 11. Snapshots work for the reference engine only, until the hand-written
     engine is given the five `Restorable` functions.
+12. The order types stop at limit and market, three times in force, and the
+    three instructions of section 8.6. No stop orders, no pegged orders, no
+    minimum quantity, no auctions. The gateway's Accepted message does not
+    echo an order's instructions back.

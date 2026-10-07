@@ -211,7 +211,9 @@ class Journaled {
 };
 
 // A number that identifies what an engine holds: which instruments are open,
-// every resting order in the order it would trade, and the running totals.
+// every resting order in the order it would trade (with what it hides, what
+// the market calls it and the instructions it carries), and the running
+// totals.
 // Two engines with the same digest are, for practical purposes, in the same
 // state. It uses only the queries of the engine contract, so it works for any
 // engine, and it is what the recovery tools print.
@@ -235,6 +237,11 @@ template <engine::EngineLike Engine>
                 h = mix(h, order.token);
                 h = mix(h, order.price);
                 h = mix(h, order.qty);
+                h = mix(h, order.hidden);
+                h = mix(h, order.display);
+                h = mix(h, order.market_ref());
+                h = mix(h, order.post_only ? 1U : 0U);
+                h = mix(h, static_cast<unsigned char>(order.self_match));
                 return true;
             });
         }
@@ -247,6 +254,7 @@ template <engine::EngineLike Engine>
     h = mix(h, stats.trades);
     h = mix(h, stats.traded_shares);
     h = mix(h, stats.unfilled_shares);
+    h = mix(h, stats.self_matches);
     h = mix(h, engine.open_orders());
     return h;
 }
