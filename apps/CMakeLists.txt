@@ -23,3 +23,7 @@ obe_add_app(mm_sim mm_sim.cpp)
 # The journal (stretch idea 1): an engine that records its requests, and
 # recovers from the record after being killed.
 obe_add_app(engine_journal engine_journal.cpp)
+
+# The tick store (stretch idea 3): a day's best bids and offers on disk,
+# queried by time.
+obe_add_app(tick_store tick_store.cpp)

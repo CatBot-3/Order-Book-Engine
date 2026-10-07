@@ -27,6 +27,7 @@ obe_add_test(
           util/latency_histogram_test.cpp
           util/measurement_test.cpp
           util/huge_pages_test.cpp
+          util/varint_test.cpp
           book/bbo_hash_test.cpp
           book/implementations_test.cpp)
 
@@ -109,6 +110,17 @@ obe_add_test(
 obe_add_test(obe_hand_written_journal_tests LABELS needs-your-code SOURCES
              journal/recovery_test.cpp)
 target_compile_definitions(obe_hand_written_journal_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+
+# The tick store (stretch idea 3): the codec contract and the file around it,
+# typed over the codec. The passing build runs them on RawCodec, the
+# needs-your-code build on the hand-written DeltaCodec, with the compression
+# target added.
+set(OBE_STORE_TEST_SOURCES store/tick_codec_test.cpp store/tick_file_test.cpp)
+obe_add_test(obe_store_tests LABELS unit SOURCES ${OBE_STORE_TEST_SOURCES}
+                                                 store/tick_profile_test.cpp)
+obe_add_test(obe_hand_written_store_tests LABELS needs-your-code SOURCES
+             ${OBE_STORE_TEST_SOURCES} store/compression_test.cpp)
+target_compile_definitions(obe_hand_written_store_tests PRIVATE OBE_TEST_HAND_WRITTEN)
 
 # The integration tests below are shell scripts. They are run through bash
 # explicitly so they work on a checkout that lost its executable bits, which is
@@ -340,4 +352,34 @@ if(OBE_BUILD_APPS AND OBE_BASH)
       20261006 pooled)
   set_tests_properties(journal_crash_test_hand_written_engine PROPERTIES LABELS
                                                                           "needs-your-code")
+endif()
+
+# The tick store through the real program: a generated feed recorded, checked
+# against the feed, queried by time, then cut short and damaged. The second
+# test is the same with the hand-written codec.
+if(OBE_BUILD_APPS AND OBE_BASH)
+  add_test(
+    NAME tick_store_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/tick_store_smoke.sh" $<TARGET_FILE:itch_synth>
+      $<TARGET_FILE:tick_store> "${CMAKE_CURRENT_BINARY_DIR}/tick_store_smoke")
+  set_tests_properties(tick_store_smoke PROPERTIES LABELS "integration")
+
+  add_test(
+    NAME tick_store_delta_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/tick_store_smoke.sh" $<TARGET_FILE:itch_synth>
+      $<TARGET_FILE:tick_store> "${CMAKE_CURRENT_BINARY_DIR}/tick_store_smoke" delta)
+  set_tests_properties(tick_store_delta_smoke PROPERTIES LABELS "needs-your-code")
+endif()
+
+# The tick benchmark runs end to end, and every store it builds gives back the
+# ticks it was given. A handful of ticks: the timings mean nothing here.
+if(OBE_BUILD_BENCH)
+  add_test(NAME tick_bench_smoke COMMAND tick_bench --codec raw --ticks 30000 --queries 50 --runs
+                                         1)
+  set_tests_properties(tick_bench_smoke PROPERTIES LABELS "integration")
+  add_test(NAME tick_bench_delta_smoke COMMAND tick_bench --codec delta --ticks 30000 --queries
+                                               50 --runs 1)
+  set_tests_properties(tick_bench_delta_smoke PROPERTIES LABELS "needs-your-code")
 endif()

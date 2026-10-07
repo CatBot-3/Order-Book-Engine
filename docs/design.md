@@ -272,6 +272,10 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Recovery | `tests/journal/recovery_test.cpp` | an engine rebuilt from a journal holds, said and goes on to say exactly what the original did; stopping short anywhere gives the engine as it was then; group commit loses only the unfinished batch |
 | Snapshot | `tests/journal/snapshot_test.cpp` | restore then compare as above; each thing a snapshot could forget; damaged and implausible snapshots refused |
 | Recovery from files | `tests/journal/journal_file_test.cpp`, `scripts/journal_crash_test.sh` | a torn tail cut and carried on in the same file; the real program killed repeatedly ends with the journal of a run that never was |
+| Varint | `tests/util/varint_test.cpp` | every size boundary, truncation at every length, overlong and overflowing encodings refused |
+| Tick codec | `tests/store/tick_codec_test.cpp` | lossless for every tick, likely or not; nothing survives a reset; no read outside the buffer on arbitrary or damaged bytes |
+| Tick store | `tests/store/tick_file_test.cpp`, `fuzz/tick_store_fuzz.cpp`, `scripts/tick_store_smoke.sh` | ranges of time against a filter over the plain list; a store never finished, cut at every byte, with every single-bit error, with an index that lies; the real program against a replay of the feed |
+| Compression | `tests/store/compression_test.cpp` | the hand-written codec's size on generated ticks, against a first target |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
 orders that recomputes the best bid and offer by scanning every order after
@@ -307,6 +311,8 @@ bodies are left out until they are written.
 | Avellaneda-Stoikov strategy | `include/obe/sim/avellaneda_stoikov.hpp` | **to write** |
 | Journal, replay, snapshot, recovery from files | `include/obe/journal/` | written |
 | Snapshot support for the hand-written engine | the five `Restorable` functions, in `include/obe/engine/matching_engine.hpp` | optional: see below |
+| Tick store: varints, the file, the reference codec, the profile | `include/obe/util/varint.hpp`, `include/obe/store/` | written |
+| Compressing tick codec | `include/obe/store/delta_codec.hpp` | **to write** |
 
 Each "to write" header holds the interface, the questions to settle and where
 the measurements that settle them come from. Their tests are built into
@@ -315,7 +321,7 @@ second executables (`obe_hand_written_tests` for the containers,
 `obe_hand_written_concurrency_tests` for the ring) from the same sources as the
 reference tests, and carry the `ctest` label `needs-your-code`. The strategy
 has an executable of its own, `obe_hand_written_sim_tests`, under the same
-label:
+label, and the tick codec has `obe_hand_written_store_tests`:
 
 ```sh
 ctest --preset debug -LE needs-your-code     # everything that is finished
@@ -401,6 +407,24 @@ write for the same reason those are: it is the part of the simulator that
 carries the idea, it is about twenty lines, and a strategy that cannot be
 derived at a whiteboard is not one to put a name to. Everything else in the
 simulator runs without it.
+
+### 6.9 Compressing tick codec
+
+*(yours)*
+
+Not on the spec's list either, and left to write for the same reason as the
+strategy: it is the one part of the tick store that is an idea and not
+plumbing. The file, the index, the recovery and the tools are done and tested
+around a codec that does not compress (section 13).
+
+The order of work the header suggests is the reverse of the obvious one. Run
+`tick_store profile` on a real file first, and write down what the table
+says before designing anything: a codec is a bet on that table, and one
+designed from a guess about markets is usually a bet on the wrong thing.
+Then the simplest design that is correct, measured, and after that one
+experiment at a time in [`optimization-log.md`](optimization-log.md), each
+with bytes per tick and ticks per second before and after, and the same file
+through `zstd` beside them.
 
 ## 7. Phase 4 structure
 
@@ -1247,7 +1271,7 @@ of body, so a request costs 54 bytes on disk.
 The version is 2: the submit record grew when orders gained instructions
 (section 8.6). A version 1 file is refused by its header, not converted. A
 journal is a record of what one version of the engine was asked, and it
-replays to the same state only on that version (section 13, item 15).
+replays to the same state only on that version (section 14, item 15).
 
 Why each field is there:
 
@@ -1296,7 +1320,7 @@ One case is beyond telling: damage inside the very last record looks like a
 torn tail and is treated as one. If that record had been synced and its
 result announced, cutting it loses an acknowledged request. Closing that gap
 takes a second copy of the journal somewhere else, which is replication and
-is not here (section 14).
+is not here (section 15).
 
 ### 12.5 What "written" means
 
@@ -1439,7 +1463,258 @@ block device that can be told to drop unsynced writes (dm-flakey and the
 like). Take the calls out and every test here still passes. That is a known
 gap, and the reason section 12.5 says what the code relies on the device for.
 
-## 13. Decisions that are open to change
+## 13. Tick store (`include/obe/store`)
+
+The book publishes its best bid and offer every time it changes, and until
+now nothing kept what it published. This layer keeps it: every update of a
+day in one file, compressed, and answerable for "what happened between 10:00
+and 10:05" without reading the day. It is the third of the spec's stretch
+ideas.
+
+### 13.1 Shape
+
+| File | What it is |
+|---|---|
+| `util/varint.hpp` | variable-length integers and zigzag, the two building blocks of a compact format |
+| `store/tick_codec.hpp` | what a tick is (`book::BboUpdate`), the contract of a codec, and `RawCodec`: every field at full width, 34 bytes a tick |
+| `store/delta_codec.hpp` | `DeltaCodec`, the compressing one. **Written by hand** (section 6.9) |
+| `store/tick_file.hpp` | the file: `TickWriter`, `TickRecorder` (a book listener), `TickReader` |
+| `store/tick_profile.hpp` | `TickProfile`: what consecutive ticks differ by, measured |
+| `store/codecs.hpp` | the codecs by name and by the number a file carries |
+| `gen/tick_gen.hpp` | generated ticks for the tests and the benchmark |
+| `apps/tick_store.cpp` | `record`, `info`, `query`, `verify`, `profile` |
+| `bench/tick_bench.cpp` | bytes per tick, write and read cost, and query cost by block size |
+
+The split that matters is between the codec and the file. The codec knows how
+one tick after another becomes bytes and nothing about files. The file knows
+about blocks, checksums and the index, and nothing about how a tick is
+encoded. The reference codec makes the file testable before the compressing
+one exists, and every test of the file is run again on the compressing one
+when it does.
+
+### 13.2 What a codec promises
+
+Three functions (`tick_codec.hpp`):
+
+| Function | What it does |
+|---|---|
+| `reset()` | forgets everything |
+| `encode(tick, out)` | writes one tick and returns its length, at most `kMaxTickSize` |
+| `decode(p, end, tick)` | reads one and returns its length, or 0 if no whole tick is there. It never reads at or past `end`, whatever the bytes are |
+
+A codec may keep state between calls, and compressing ones live on it: the
+last tick they saw is what the next one is written as a difference from. Two
+rules keep that safe.
+
+1. **The encoder and the decoder keep the same state.** After writing ticks
+   1 to k from a reset, and after reading them back from a reset, both are
+   ready for tick k+1 in the same way. Everything else follows from this.
+2. **Lossless for every tick, not for likely ones.** Any time in any order,
+   any price, any size up to 2^64 - 1 comes back exactly. A codec is free to
+   be bad at ticks no market produces. It is not free to be wrong about them:
+   a store that is right "for realistic data" is right until the day the data
+   is unusual, which is the day someone needs it.
+
+The tests hold a codec to both with streams no feed would produce
+(`hostile_ticks` in `tests/support/tick_streams.hpp`) as well as with ones
+shaped like a market.
+
+### 13.3 The file
+
+```
+file header   16 bytes   "OBET", version (u16), codec (u16), ticks per block (u32), zero (u32)
+block         32 bytes   "BLK1", crc (u32), ticks (u32), payload bytes (u32),
+                         earliest timestamp (u64), latest timestamp (u64)
+              payload    the block's ticks, encoded from a reset
+... more blocks ...
+index         24 bytes   "IDX1", crc (u32), blocks (u32), symbols (u32), ticks (u64)
+              32 each    per block: offset, ticks, payload bytes, earliest, latest
+              10 each    per symbol: locate (u16), name (8 characters)
+trailer       12 bytes   offset of the index (u64), "OBEX"
+```
+
+Integers are big-endian, and each checksum is a CRC-32 of everything in its
+section after the checksum field, as in the journal.
+
+**Why blocks.** A compressing codec writes each tick against the ones before
+it, so reading tick fifty million would mean decoding the forty-nine million
+before. Cutting the stream into blocks, with the codec reset at the start of
+each, bounds that: any tick is at most one block's decoding away. The price is
+that the first ticks of every block have nothing to be a difference from.
+Bigger blocks compress a little better and seek a little worse. The size is a
+parameter (`--block`, 4096 ticks by default) so that the trade can be
+measured, and `tick_bench` measures it at three sizes.
+
+**Why the index is at the end.** It lists each block's place and the range of
+time it covers, which is what turns a query for a range into a seek. None of
+that is known until the block is written, and a recorder does not know how
+many blocks there will be. So the index is written once, last, and the
+trailer says where it starts.
+
+**Why the time range is in each block's own header as well.** So that the
+blocks describe themselves without the index (next section).
+
+### 13.4 A file without an index is still a store
+
+A recorder that is killed never writes its index. Every block carries its own
+length and checksum, so a reader can start at the file header and walk: read a
+block header, check the block against its checksum, step over it, repeat,
+stopping at the first block that is not whole. The index is rebuilt from what
+it found. Such a store opens as *recovered*, and what follows the last whole
+block is ignored: it was being written when the recorder stopped.
+
+This is the journal's torn tail again (section 12.4), and for the same
+reason: a file that is appended to must expect to be cut off mid-append, and
+a format that cannot say where its good part ends has to be thrown away
+whole. Only the directory of names is lost, since it lives in the index.
+
+A block is handed to the writer's destination whole, in one call, when it is
+full. So a writer that stops loses the block it was filling, by default up to
+4095 ticks, and whatever its destination had not yet passed on: `tick_store`
+writes through an ordinary buffered file and syncs nothing, because nothing
+waits on a tick store reaching the disk.
+
+### 13.5 An index is checked, not trusted
+
+An index with the right checksum holds the bytes that were written. That is
+not the same as holding the truth. If its entry for a block gave a time range
+narrower than the block's ticks, queries would skip a block that holds part
+of their answer and report nothing wrong. So the reader believes an index
+only if it is whole, its checksum matches, **and** it describes exactly the
+blocks that lie between the file header and itself: each one where the last
+ended, each block's own header saying what the index says, and nothing left
+over. Otherwise the index is set aside and the blocks are found by walking.
+
+The check reads every block's 32-byte header when the store is opened, and
+no payload. On a mapped file that is one page touched per block.
+
+It cannot catch a block whose own header misstates its time range, since
+there is then nothing to compare with but the ticks themselves. That takes a
+writer with a bug, not a damaged disk, and `tick_store verify` is the check
+for it: it decodes everything.
+
+### 13.6 Queries
+
+`scan(from, to, visitor)` hands over every tick with `from <= time < to`, in
+the order they were stored, and stops early if the visitor says so. Blocks
+whose range cannot hold such a tick are not read; the result says how many
+were read and how many were ruled out.
+
+1. **The range is half-open**, so that consecutive ranges neither overlap nor
+   leave a gap. One consequence needed an exception: no end time could then
+   include a tick stamped with the largest representable time. `kEndOfTime`
+   as the end therefore means "no end".
+2. **Nothing requires time to rise.** A feed's time does, but the store does
+   not depend on it: each block records its earliest and latest, and a query
+   looks at every block that could matter. On a store in time order that is
+   one or two blocks; on a shuffled one it is most of them, and still right.
+3. **All securities share one stream.** That makes a range of time cheap and
+   "one stock for the whole day" a scan of every block, filtered. The
+   alternative is a stream per security: the reverse trade, better
+   compression, and thousands of open blocks while recording (section 14,
+   item 24).
+
+### 13.7 Damage
+
+A block is checked against its checksum before any of its ticks is handed
+over, so a visitor never sees a tick from a block that was damaged after it
+was written. The scan stops there and says which block. Blocks before it have
+been delivered; blocks after it are untouched and can be reached by a query
+for a later range, because each starts from a reset and depends on nothing
+before it.
+
+Where damage is found depends on where it is:
+
+| Damaged | Found |
+|---|---|
+| file header | when opening: not a store, or another codec's |
+| index or trailer | when opening: the index is set aside, the store opens as recovered with every tick |
+| a block's header | when opening: it no longer matches the index, so the blocks are walked, and the walk stops at it |
+| a block's ticks or its checksum | when that block is read |
+
+The last row is deliberate. Checking every block's checksum on opening would
+find the damage sooner and make opening a day's file cost a read of the whole
+file, which is what the index exists to avoid. `tick_store verify` is the
+full check, for when it is wanted.
+
+The test behind this section changes one bit at a time across a whole file
+and requires, each time, that no tick comes back that was not written, and
+that when ticks are missing either the way the store opened or the way the
+scan ended says so.
+
+### 13.8 Varints, and one encoding per number
+
+`util/varint.hpp` has the usual LEB128 varint (seven bits a byte, the top bit
+meaning "more follows") and zigzag (which folds small negative numbers onto
+small positive ones). One choice in it is worth stating. The decoder accepts
+only the **shortest** encoding of a number: `0x80 0x00`, two bytes that would
+decode to zero, is refused.
+
+A decoder that took it would let two different files mean the same thing.
+Then "decode and encode back gives the same bytes" stops being true, and that
+property is the cheapest strong test a format can have: the fuzzer checks it
+on every input. It also closes a small door: padding is where a hostile file
+hides length.
+
+### 13.9 The profile, and why the generated ticks are not a market
+
+A compressing codec is a bet on what its input looks like. `tick_store
+profile` measures the things such a bet is about, on a real file: the gaps
+between timestamps, how soon a security ticks again, which fields of a quote
+change together, and by how much. The hand-written codec is meant to be
+designed from that table (section 6.9).
+
+The tests and the benchmark need ticks without a file, and
+`gen/tick_gen.hpp` makes them: time in steps of up to 50 microseconds,
+securities picked evenly, one field changing at a time by a cent or by round
+lots. That is the shape of a market with none of its substance. A real feed
+is burstier, a few of its securities do most of the ticking, and its sizes
+are not all round lots. So the target in `tests/store/compression_test.cpp`
+(10 bytes a tick, against 34) says a codec does what a codec should on input
+of that shape, and no more. The number for a real day comes from `tick_store
+record` on a real file, and has not been taken.
+
+### 13.10 How it is tested
+
+1. **The codec contract** (`tests/store/tick_codec_test.cpp`, typed over the
+   codecs): every stream comes back; every field at its limits; time standing
+   still and running backwards; after a reset nothing of the past is left, on
+   the writing side and the reading side; a run cut into blocks anywhere; a
+   tick cut short is not a tick; arbitrary and damaged bytes are read without
+   leaving the buffer, which AddressSanitizer enforces because every buffer is
+   exactly as large as its data.
+2. **The file** (`tick_file_test.cpp`, typed the same way): what the writer
+   lays out, block by block; random ranges of time against a filter over the
+   plain list; the two ends of a range; that the index spares a query the
+   blocks it cannot need; a store never finished; a store cut at every byte;
+   every single-bit error; an index that checks out and lies, nine ways; a
+   block with a correct checksum over the wrong contents; another codec's
+   store; and a recorder on a real book against a plain list of what the book
+   published.
+3. **The profile** (`tick_profile_test.cpp`): seven ticks chosen so that each
+   lands in a different cell, with every table worked out by hand.
+4. **The varint** (`tests/util/varint_test.cpp`): each size boundary, the
+   largest value, truncation at every length, overlong and overflowing
+   encodings refused, zigzag at both ends of the range.
+5. **`fuzz/tick_store_fuzz.cpp`**: on arbitrary bytes, a store that opens
+   describes itself consistently and a scan hands over only what it claims;
+   on stores built from the input, what was written comes back, a cut gives
+   whole blocks, and a changed byte never produces a tick that was not
+   written.
+6. **`scripts/tick_store_smoke.sh`**, on the real program: a generated feed
+   recorded and checked against a fresh replay of the feed by the same
+   per-security hash that compares two books (section 3.4); ranges compared
+   with a filter over the full dump; then the file cut short, and a byte of
+   one block changed.
+
+The typed suites run on `RawCodec` in the passing build and on `DeltaCodec`
+under the `needs-your-code` label, where `compression_test.cpp` adds the size
+target.
+
+What none of this measures is a real day: how many ticks one has, what the
+profile of a real feed looks like, and how small a real store is.
+
+## 14. Decisions that are open to change
 
 These were made along the way to get each phase standing. Each is cheap to
 revisit.
@@ -1540,8 +1815,34 @@ revisit.
     increasing. Giving every resting order a fresh reference at the moment it
     rests would restore the order, and add a second name to every order for
     the sake of a property nothing here relies on.
+24. **The tick store is one stream in time order.** A range of time is a
+    seek; one security for a whole day is a scan of every block. A stream per
+    security would reverse that and compress better, since each stream's
+    ticks are far more alike than the mixture is, at the cost of a block in
+    memory for every security while recording and a merge to read anything
+    in time order. It is the first thing to revisit if the queries turn out
+    to be per security.
+25. **A tick is a best-bid-and-offer update.** Depth, trades and the orders
+    themselves are not stored. Storing the feed's messages would keep
+    everything and need a book replay to answer "what was the quote at
+    10:00"; storing the quote answers that directly and cannot answer
+    anything about depth. The format has room for a second kind of record
+    only through its version number.
+26. **A block is a number of ticks, not a number of bytes.** Counting ticks
+    makes what a query costs to decode predictable and the writer's buffer a
+    fixed size. Counting bytes would make blocks the size of disk pages and
+    their reads uniform, which matters more once the store is read from a
+    disk and not a mapping.
+27. **A reader takes the whole file as one span.** It is mapped, and the
+    operating system pages in what a query touches. There is no reader over
+    a stream or a socket, and on a 32-bit address space a large day would not
+    fit.
+28. **An index that does not match its blocks is set aside, not repaired.**
+    The store then opens as recovered and nothing rewrites the file. A tool
+    that rebuilt the index in place would be a few lines; it would also be
+    the only code here that modifies a store after it was written.
 
-## 14. Known limits
+## 15. Known limits
 
 1. Linux only: `mmap`, `epoll`, `perf_event_open`.
 2. GCC and Clang only: `__builtin_bswap*` and, in the benchmarks, `rdtsc`.
@@ -1576,3 +1877,13 @@ revisit.
     three instructions of section 8.6. No stop orders, no pegged orders, no
     minimum quantity, no auctions. The gateway's Accepted message does not
     echo an order's instructions back.
+13. A tick store is written once. Nothing appends to a finished store, joins
+    two, or splits one, and a query for one security reads every block in its
+    range of time (section 14, item 24).
+14. Until the hand-written codec exists a store is 34 bytes a tick, and the
+    only compression figure is the target on generated ticks. Nothing has
+    been recorded from a real day: not the number of ticks, not their
+    profile, not a file size.
+15. The tick store is not connected to the live programs. `tick_store record`
+    replays a file. `md_listen` could record what it receives through the
+    same `TickRecorder`, and does not.

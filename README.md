@@ -29,6 +29,7 @@ did not help.
 | 8 | Market-making simulator | fill model, metrics, two simple strategies and `mm_sim` done; the Avellaneda-Stoikov strategy is being written; not yet run on a real file |
 | 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; nothing measured yet |
 | 10 | Self-match prevention and more order types (stretch idea 2) | done in the reference engine: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot; the pooled engine has them to write |
+| 11 | Compressed tick store (stretch idea 3) | the file format, queries by time, recovery of an unfinished store, `tick_store` and `tick_bench` done on a codec that does not compress; the compressing codec is being written; nothing recorded from a real file yet |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -58,6 +59,9 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 
  surviving a crash: requests ──> [journal] number + checksum ──> file, then ──> [engine]
                     afterwards:  snapshot + journal ──> replay ──> the same engine
+
+ kept for later:    [book] best bid/offer events ──> [store] codec ──> blocks + index on disk
+                    a range of time ──> the index ──> the blocks that can hold it ──> ticks
 ```
 
 | Directory | Contents |
@@ -69,12 +73,13 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 | `include/obe/net/` | the order-entry protocol, `OrderGateway` on epoll, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
 | `include/obe/sim/` | the market-making simulator: fill model, the simple strategies, the hand-written Avellaneda-Stoikov strategy, volatility estimate, report |
 | `include/obe/journal/` | the write-ahead journal: records, writer, a reader that tells a torn tail from damage, replay, snapshots, the file layer, recovery from files |
-| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock` |
-| `include/obe/gen/` | seeded generators: order flow for the engine, and a raw ITCH stream for fixtures |
-| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen`; `mm_sim`; `engine_journal` |
-| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `journal_bench` (journaling and recovery), `micro_bench` (Google Benchmark) |
-| `tests/`, `fuzz/` | unit, scenario, golden, differential, property, round-trip and recovery tests; libFuzzer targets for the parser and the journal |
-| `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, latency curve, PGO build, the journal crash test |
+| `include/obe/store/` | the tick store: the codec contract and the reference codec, the hand-written compressing codec, the block file with its index, writer, recorder and reader, the tick profile |
+| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock`; CRC-32, varints |
+| `include/obe/gen/` | seeded generators: order flow for the engine, a raw ITCH stream for fixtures, and ticks for the store |
+| `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen`; `mm_sim`; `engine_journal`; `tick_store` |
+| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `journal_bench` (journaling and recovery), `tick_bench` (tick codecs and block sizes), `micro_bench` (Google Benchmark) |
+| `tests/`, `fuzz/` | unit, scenario, golden, differential, property, round-trip, recovery and tick-store tests; libFuzzer targets for the parser, the journal and the tick store |
+| `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, latency curve, PGO build, the journal crash test, the tick store smoke test |
 | `docs/` | [`design.md`](docs/design.md), [`benchmark-method.md`](docs/benchmark-method.md), [`optimization-log.md`](docs/optimization-log.md) |
 
 The library is header-only. Why each piece is shaped the way it is: see
@@ -260,6 +265,26 @@ F=data/01302019.NASDAQ_ITCH50
     Interrupt the `run` with `kill -9` and start it again with the same
     options: it says what it recovered from and carries on.
 
+12. **A day's quotes on disk, asked by time.** `record` replays a file through
+    the book and stores every best-bid-and-offer update; `verify --against`
+    replays it again and checks the store holds exactly what the book
+    publishes; `query` reads only the blocks a range of time can touch.
+    `profile` prints what consecutive ticks differ by, which is the table to
+    design the compressing codec from. Until that codec is written, `--codec
+    delta` exits with status 4 and a store is 34 bytes a tick.
+
+    ```sh
+    scripts/tick_store_smoke.sh $B/apps/itch_synth $B/apps/tick_store
+
+    $B/apps/tick_store profile $F
+    $B/apps/tick_store record --codec raw $F data/day.ticks
+    $B/apps/tick_store verify --against $F data/day.ticks
+    $B/apps/tick_store info data/day.ticks
+    $B/apps/tick_store query --symbol AAPL --from 10:00:00 --to 10:00:01 data/day.ticks
+
+    $B/bench/tick_bench --file $F --cpu 4 --json results/ticks.json
+    ```
+
 ## Matching rules
 
 These are design choices, stated here so nobody has to infer them from the
@@ -334,7 +359,8 @@ number of connections and the CPUs each program was pinned to.
 | Network | the gateway over real loopback sockets: partial reads, mid-message disconnects, bad input, slow and paused clients; the feed with packets lost, repeated and reordered; the load generator's schedule against a server that stalls, in simulated time |
 | Simulation | each rule of the fill model on hand-built messages; over generated markets, the queue ahead of every quote against the test's own copy of the orders, and the profit recounted from the fills |
 | Recovery | an engine rebuilt from its journal, or from a snapshot and the journal after it, holds, said and goes on to say exactly what the original did; a journal cut anywhere recovers to the last whole record; the real program, killed repeatedly with `SIGKILL` in the middle of writes, ends with the journal of a run that was never killed |
-| Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input. On the journal: any cut gives a prefix of the requests, and any changed byte is noticed and never applied |
+| Tick store | each codec gives back every tick, likely or not, and reads arbitrary bytes without leaving them; ranges of time against a filter over the plain list; a store that was never finished, cut at every byte, or changed one bit at a time never yields a tick that was not written; an index that checks out and lies is not believed; the real program against a fresh replay of the feed |
+| Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input. On the journal: any cut gives a prefix of the requests, and any changed byte is noticed and never applied. On the tick store: a file that opens describes itself consistently, and a store with one byte changed never yields a tick that was not written |
 | Sanitizers | AddressSanitizer and UBSan on all tests; ThreadSanitizer on all of them too, which is what checks the queues' memory ordering |
 | CI | all of the above on GCC and Clang, plus a formatting check |
 
@@ -366,6 +392,10 @@ number of connections and the CPUs each program was pinned to.
    it properly means holding every response until its request is on disk and
    giving clients a way to learn what survived. One file on one disk: no
    rotation and no second copy.
-10. Linux only, GCC and Clang only.
+10. The tick store keeps the best bid and offer and nothing else: no depth,
+    no trades. It is one stream in time order, so a query for one security
+    reads every block in its range of time. No size or speed is quoted for
+    it: nothing has been recorded from a real day.
+11. Linux only, GCC and Clang only.
 
 This project is not affiliated with or endorsed by Nasdaq.

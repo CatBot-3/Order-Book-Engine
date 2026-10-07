@@ -21,6 +21,7 @@ perf.data.old
 # Fuzzing
 fuzz/corpus/
 fuzz/journal_corpus/
+fuzz/tick_corpus/
 crash-*
 leak-*
 timeout-*
@@ -29,6 +30,9 @@ oom-*
 # Journals and snapshots written by engine_journal and journal_bench
 *.journal
 *.snapshot
+
+# Tick stores written by tick_store
+*.ticks
 
 # Editors and tools
 .vscode/
