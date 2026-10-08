@@ -55,6 +55,16 @@ target_compile_definitions(
                      "OBE_BUILD_TYPE=\"${CMAKE_BUILD_TYPE}\"")
 set_target_properties(tick_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bench")
 
+# System calls per request, by transport: a server thread echoing to a client
+# thread over loopback.
+add_executable(transport_bench transport_bench.cpp)
+target_link_libraries(transport_bench PRIVATE obe::obe Threads::Threads)
+target_compile_definitions(
+  transport_bench PRIVATE "OBE_BUILD_FLAGS=\"${OBE_BUILD_FLAGS}\""
+                          "OBE_BUILD_TYPE=\"${CMAKE_BUILD_TYPE}\"")
+set_target_properties(transport_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                 "${CMAKE_BINARY_DIR}/bench")
+
 # Micro benchmarks of the building blocks (Google Benchmark).
 add_executable(micro_bench micro_bench.cpp)
 target_link_libraries(micro_bench PRIVATE obe::obe benchmark::benchmark benchmark::benchmark_main)

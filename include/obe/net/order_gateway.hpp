@@ -1,10 +1,7 @@
 #pragma once
 
-#include <sys/epoll.h>
-#include <sys/socket.h>
-
 #include <algorithm>
-#include <cerrno>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -20,9 +17,9 @@
 #include "obe/engine/concepts.hpp"
 #include "obe/engine/types.hpp"
 #include "obe/feed/codec.hpp"
-#include "obe/net/epoll_loop.hpp"
+#include "obe/net/epoll_transport.hpp"
 #include "obe/net/protocol.hpp"
-#include "obe/net/socket.hpp"
+#include "obe/net/transport.hpp"
 #include "obe/types.hpp"
 
 // The order gateway: TCP in, matching engine in the middle, reports back out.
@@ -30,11 +27,16 @@
 //   client ──TCP──> [ read, frame, decode ] ──> engine.submit / cancel / replace
 //   client <──TCP── [ encode, queue, write ] <── the engine's reports
 //
-// One thread does all of it, driven by epoll. A request is read, decoded and
-// handed to the engine in the same call; the engine's reports land in the
-// output buffers of the connections they belong to before that call returns;
-// and every buffer that gained something is written out at the end of the
-// turn. Nothing is locked because nothing is shared.
+// One thread does all of it. A request is read, decoded and handed to the
+// engine in the same call; the engine's reports are queued for the
+// connections they belong to before that call returns; and everything queued
+// is sent on its way at the end of the turn. Nothing is locked because
+// nothing is shared.
+//
+// The gateway is the session and not the plumbing. Getting bytes in and out
+// of sockets is a transport's job (transport.hpp), and the gateway is written
+// once for any of them: epoll by default, io_uring through the third template
+// parameter. What is here is what does not depend on that choice.
 //
 // A connection is an owner. The gateway gives each new connection the next
 // owner id and never reuses one, so a report can always be routed, or
@@ -47,9 +49,10 @@
 //   that has not arrived completely, and consume() only acts on whole ones.
 //
 //   Slow clients. A client that stops reading must not stall the others or
-//   grow the server's memory without bound. Writes never block: what the
-//   socket will not take is kept, the connection is watched for writability,
-//   and a client whose backlog passes a limit is disconnected.
+//   grow the server's memory without bound. Sending never waits: what the
+//   kernel will not take stays queued in the transport, and a client whose
+//   backlog passes a limit is disconnected. The limit and the judgement are
+//   here; the queue is the transport's.
 //
 //   Disconnects at any moment. A connection that closes in the middle of a
 //   message just loses that message; the bytes are discarded with the
@@ -88,8 +91,9 @@ struct GatewayStats {
 };
 
 // Impl names an engine (obe/engine/engines.hpp). MarketData is the engine's
-// market-data sink, usually a MoldPacketizer.
-template <class Impl, engine::MarketDataSink MarketData>
+// market-data sink, usually a MoldPacketizer. Net is how bytes reach the
+// sockets (transport.hpp).
+template <class Impl, engine::MarketDataSink MarketData, Transport Net = EpollTransport>
 class OrderGateway {
  public:
     // The engine's report sink: turns each report into a message on the
@@ -98,6 +102,11 @@ class OrderGateway {
      public:
         explicit Router(OrderGateway& gateway) noexcept : gateway_(&gateway) {}
 
+        // The list of an owner's open orders is kept whether or not the
+        // report could be queued. A connection that is about to be dropped
+        // (this very report may be the one that showed it to be too slow)
+        // still has its orders cancelled when it is closed, and can only have
+        // them cancelled if they were written down.
         void on_accepted(const engine::Accepted& r) {
             if (Connection* c = gateway_->deliver(r.owner, to_wire(r))) {
                 c->open.insert(r.order_id);
@@ -138,22 +147,19 @@ class OrderGateway {
     explicit OrderGateway(MarketData& market_data, const GatewayConfig& cfg = {}, Clock clock = {})
         : cfg_(cfg),
           clock_(clock ? std::move(clock) : since_now()),
+          net_(TransportConfig{.read_chunk =
+                                   std::max<std::size_t>(cfg.read_chunk, kMaxRequestSize)}),
           router_(*this),
-          engine_(std::make_unique<Engine>(router_, market_data)),
-          scratch_(std::max<std::size_t>(cfg.read_chunk, kMaxRequestSize)) {}
+          engine_(std::make_unique<Engine>(router_, market_data)) {}
 
     OrderGateway(const OrderGateway&) = delete;
     OrderGateway& operator=(const OrderGateway&) = delete;
 
     // Starts accepting connections. Port 0 lets the system choose; port()
     // says which it chose.
-    void listen(const std::string& host, std::uint16_t port) {
-        listener_ = listen_tcp(host, port);
-        port_ = local_port(listener_.get());
-        loop_.add(listener_.get(), EPOLLIN, kListenerTag);
-    }
+    void listen(const std::string& host, std::uint16_t port) { net_.listen(host, port); }
 
-    [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+    [[nodiscard]] std::uint16_t port() const noexcept { return net_.port(); }
 
     // The engine, for opening instruments before trading starts.
     [[nodiscard]] Engine& engine() noexcept { return *engine_; }
@@ -161,79 +167,86 @@ class OrderGateway {
 
     [[nodiscard]] Nanos now() const { return clock_(); }
 
-    // One turn of the event loop: waits up to timeout_ms for sockets to become
-    // ready, serves every one that is, writes out what that produced and
-    // closes the connections that ended. Returns the number of ready sockets.
+    // One turn of the event loop: waits up to timeout_ms for something to
+    // happen on a socket, serves everything that did, sends what that
+    // produced on its way and closes the connections that ended. Returns the
+    // number of things the transport served; 0 means the time ran out.
     std::size_t poll(int timeout_ms) {
-        const std::span<const epoll_event> events = loop_.wait(timeout_ms);
-        for (const epoll_event& ev : events) {
-            if (ev.data.u64 == kListenerTag) {
-                accept_all();
-                continue;
-            }
-            const auto it = connections_.find(static_cast<engine::OwnerId>(ev.data.u64));
-            if (it == connections_.end()) {
-                continue;
-            }
-            Connection& c = it->second;
-            if ((ev.events & EPOLLIN) != 0 && c.doomed == Close::No) {
-                read_from(c);
-            }
-            if ((ev.events & EPOLLOUT) != 0 && c.doomed == Close::No) {
-                flush(c);
-            }
-            if ((ev.events & (EPOLLERR | EPOLLHUP)) != 0) {
-                doom(c, Close::Peer);
-            }
-        }
+        const std::size_t served = net_.poll(timeout_ms, *this);
 
-        // Everything this turn queued goes out now, one write per connection.
-        // Flushing can doom a connection but does not add to dirty_. The loop
-        // is by index all the same, so that it would stay correct if some
-        // later change made a flush queue output: an iterator would not
-        // survive the vector growing.
-        // NOLINTNEXTLINE(modernize-loop-convert)
-        for (std::size_t i = 0; i < dirty_.size(); ++i) {
-            const auto it = connections_.find(dirty_[i]);
-            if (it != connections_.end()) {
-                it->second.dirty = false;
-                if (it->second.doomed == Close::No) {
-                    flush(it->second);
-                }
-            }
-        }
-        dirty_.clear();
+        // A connection that is being dropped is sent nothing more: what was
+        // queued for it this turn is discarded with it. So those go first.
+        close_doomed();
 
-        // Closing cancels orders, which publishes market data and can only
-        // queue reports for the connection being closed, which is already
-        // gone by then. So this loop does not grow doomed_ or dirty_ either,
-        // and is by index for the same reason as the one above.
-        // NOLINTNEXTLINE(modernize-loop-convert)
-        for (std::size_t i = 0; i < doomed_.size(); ++i) {
-            close_connection(doomed_[i]);
+        // Everything this turn queued goes out now.
+        net_.flush_all(*this);
+
+        // And the connections the flush found dead.
+        close_doomed();
+        return served;
+    }
+
+    // What the transport tells the gateway (transport.hpp). Public because a
+    // transport calls them; nothing else should.
+    ConnId on_connect() {
+        if (connections_.size() >= cfg_.max_connections) {
+            ++stats_.connections_refused;
+            return 0;
         }
-        doomed_.clear();
-        return events.size();
+        const engine::OwnerId owner = ++last_owner_;
+        connections_[owner].owner = owner;
+        ++stats_.connections_accepted;
+        return owner;
+    }
+
+    void on_data(ConnId id, std::span<const std::byte> bytes) {
+        const auto it = connections_.find(id);
+        if (it == connections_.end() || it->second.doomed != Close::No) {
+            return;
+        }
+        Connection& c = it->second;
+        if (c.in.empty()) {
+            // The common case: nothing left over from last time. Serve the
+            // requests straight out of the transport's buffer and keep only a
+            // tail that stops in the middle of a message.
+            const std::size_t used = consume(c, bytes);
+            c.in.assign(bytes.begin() + static_cast<std::ptrdiff_t>(used), bytes.end());
+        } else {
+            c.in.insert(c.in.end(), bytes.begin(), bytes.end());
+            const std::size_t used = consume(c, c.in);
+            c.in.erase(c.in.begin(), c.in.begin() + static_cast<std::ptrdiff_t>(used));
+        }
+    }
+
+    void on_disconnect(ConnId id, LinkState why) {
+        const auto it = connections_.find(id);
+        if (it != connections_.end()) {
+            doom(it->second, why == LinkState::Failed ? Close::Error : Close::Peer);
+        }
     }
 
     [[nodiscard]] std::size_t connections() const noexcept { return connections_.size(); }
-    [[nodiscard]] const GatewayStats& stats() const noexcept { return stats_; }
+    // The gateway's own counts, with the transport's byte counts folded in.
+    [[nodiscard]] GatewayStats stats() const {
+        GatewayStats s = stats_;
+        const TransportStats t = net_.stats();
+        s.bytes_in = t.bytes_in;
+        s.bytes_out = t.bytes_out;
+        s.blocked_writes = t.blocked_writes;
+        return s;
+    }
+
+    // The transport, for its own statistics.
+    [[nodiscard]] const Net& transport() const noexcept { return net_; }
 
  private:
-    static constexpr std::uint64_t kListenerTag = 0;  // owner ids start at 1
-
     enum class Close : std::uint8_t { No, Peer, Protocol, Slow, Error };
 
     struct Connection {
-        Fd fd;
         engine::OwnerId owner = 0;
-        std::vector<std::byte> in;   // the start of a request still arriving
-        std::vector<std::byte> out;  // responses not yet written
-        std::size_t out_sent = 0;    // how much of `out` has been written
+        std::vector<std::byte> in;  // the start of a request still arriving
         std::unordered_set<OrderId> open;
         Close doomed = Close::No;
-        bool dirty = false;        // in dirty_ this turn
-        bool wants_write = false;  // watching for EPOLLOUT
     };
 
     static Clock since_now() {
@@ -245,61 +258,10 @@ class OrderGateway {
         };
     }
 
-    void accept_all() {
-        for (;;) {
-            Fd fd(::accept4(listener_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
-            if (!fd.valid()) {
-                return;  // nobody else waiting (or a transient error; try next turn)
-            }
-            if (connections_.size() >= cfg_.max_connections) {
-                ++stats_.connections_refused;
-                continue;  // fd closes here
-            }
-            const int one = 1;
-            ::setsockopt(fd.get(), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-            const engine::OwnerId owner = ++last_owner_;
-            const int raw = fd.get();
-            Connection& c = connections_[owner];
-            c.fd = std::move(fd);
-            c.owner = owner;
-            loop_.add(raw, EPOLLIN, owner);
-            ++stats_.connections_accepted;
-        }
-    }
-
     void doom(Connection& c, Close why) {
         if (c.doomed == Close::No) {
             c.doomed = why;
             doomed_.push_back(c.owner);
-        }
-    }
-
-    void read_from(Connection& c) {
-        const ssize_t n = ::recv(c.fd.get(), scratch_.data(), scratch_.size(), 0);
-        if (n == 0) {
-            doom(c, Close::Peer);
-            return;
-        }
-        if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                doom(c, errno == ECONNRESET ? Close::Peer : Close::Error);
-            }
-            return;
-        }
-        const auto got = static_cast<std::size_t>(n);
-        stats_.bytes_in += got;
-        if (c.in.empty()) {
-            // The common case: nothing left over from last time. Serve the
-            // requests straight out of the read buffer and keep only a tail
-            // that stops in the middle of a message.
-            const std::size_t used = consume(c, {scratch_.data(), got});
-            c.in.assign(scratch_.begin() + static_cast<std::ptrdiff_t>(used),
-                        scratch_.begin() + static_cast<std::ptrdiff_t>(got));
-        } else {
-            c.in.insert(c.in.end(), scratch_.begin(),
-                        scratch_.begin() + static_cast<std::ptrdiff_t>(got));
-            const std::size_t used = consume(c, c.in);
-            c.in.erase(c.in.begin(), c.in.begin() + static_cast<std::ptrdiff_t>(used));
         }
     }
 
@@ -358,74 +320,53 @@ class OrderGateway {
         }
     }
 
-    // Queues a message for an owner. Returns the owner's connection, or null
-    // if the owner has gone or is about to be dropped.
+    // Queues a message for an owner. Returns the owner's connection, for the
+    // caller to keep its list of open orders by, or null if the owner has
+    // gone. A connection that is about to be dropped is returned like any
+    // other: nothing is queued for it, but it is still in the table and its
+    // orders are still its own until it is closed.
     template <class M>
     Connection* deliver(engine::OwnerId owner, const M& message) {
         const auto it = connections_.find(owner);
-        if (it == connections_.end() || it->second.doomed != Close::No) {
+        if (it == connections_.end()) {
             ++stats_.responses_dropped;
             return nullptr;
         }
         Connection& c = it->second;
-        const std::size_t at = c.out.size();
-        c.out.resize(at + feed::wire_size(message));
-        feed::encode(message, c.out.data() + at);
-        ++stats_.responses;
-        if (!c.dirty) {
-            c.dirty = true;
-            dirty_.push_back(owner);
+        if (c.doomed != Close::No) {
+            ++stats_.responses_dropped;
+            return &c;
         }
-        if (c.out.size() - c.out_sent > cfg_.max_pending_output) {
+        std::array<std::byte, kMaxResponseSize> bytes;
+        feed::encode(message, bytes.data());
+        net_.send(owner, {bytes.data(), feed::wire_size(message)});
+        ++stats_.responses;
+        if (net_.unsent(owner) > cfg_.max_pending_output) {
             // A large backlog is only a sign of a slow client if the socket
             // refuses it. A client that sent a big burst and is reading its
             // answers promptly has just as much queued at this point, so try
             // the socket before judging.
-            flush(c);
-            if (c.doomed == Close::No && c.out.size() - c.out_sent > cfg_.max_pending_output) {
+            const LinkState link = net_.flush(owner);
+            if (link != LinkState::Up) {
+                doom(c, link == LinkState::Failed ? Close::Error : Close::Peer);
+            } else if (net_.unsent(owner) > cfg_.max_pending_output) {
                 doom(c, Close::Slow);
-            }
-            if (c.doomed != Close::No) {
-                return nullptr;
             }
         }
         return &c;
     }
 
-    // Writes as much of the connection's output as the socket will take.
-    void flush(Connection& c) {
-        while (c.out_sent < c.out.size()) {
-            const ssize_t n = ::send(c.fd.get(), c.out.data() + c.out_sent,
-                                     c.out.size() - c.out_sent, MSG_NOSIGNAL);
-            if (n > 0) {
-                c.out_sent += static_cast<std::size_t>(n);
-                stats_.bytes_out += static_cast<std::uint64_t>(n);
-                continue;
-            }
-            if (n < 0 && errno == EINTR) {
-                continue;
-            }
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // The socket's buffer is full: the client is not reading as
-                // fast as it is being written to. Keep the rest and ask to be
-                // told when there is room.
-                ++stats_.blocked_writes;
-                watch_writable(c, true);
-                return;
-            }
-            doom(c, errno == EPIPE || errno == ECONNRESET ? Close::Peer : Close::Error);
-            return;
+    // Closing cancels orders, which publishes market data and can only queue
+    // reports for the connection being closed, which is already gone by then.
+    // So this loop does not grow doomed_. It is by index all the same, so
+    // that it would stay correct if some later change made a close doom
+    // another connection: an iterator would not survive the vector growing.
+    void close_doomed() {
+        // NOLINTNEXTLINE(modernize-loop-convert)
+        for (std::size_t i = 0; i < doomed_.size(); ++i) {
+            close_connection(doomed_[i]);
         }
-        c.out.clear();
-        c.out_sent = 0;
-        watch_writable(c, false);
-    }
-
-    void watch_writable(Connection& c, bool on) {
-        if (c.wants_write != on) {
-            c.wants_write = on;
-            loop_.modify(c.fd.get(), on ? (EPOLLIN | EPOLLOUT) : EPOLLIN, c.owner);
-        }
+        doomed_.clear();
     }
 
     void close_connection(engine::OwnerId owner) {
@@ -451,8 +392,7 @@ class OrderGateway {
                 ++stats_.closed_by_peer;
                 break;
         }
-        loop_.remove(c.fd.get());
-        c.fd.reset();
+        net_.close(owner);
         if (cfg_.cancel_on_disconnect && !c.open.empty()) {
             // In id order, so that the market data this publishes does not
             // depend on how a hash set happens to iterate.
@@ -469,17 +409,13 @@ class OrderGateway {
 
     GatewayConfig cfg_;
     Clock clock_;
-    EpollLoop loop_;
-    Fd listener_;
-    std::uint16_t port_ = 0;
+    Net net_;
     Router router_;
     std::unique_ptr<Engine> engine_;
     std::unordered_map<engine::OwnerId, Connection> connections_;
-    std::vector<engine::OwnerId> dirty_;   // connections with output queued this turn
     std::vector<engine::OwnerId> doomed_;  // connections to close at the end of the turn
-    std::vector<std::byte> scratch_;       // where a read lands
     engine::OwnerId last_owner_ = 0;
-    GatewayStats stats_{};
+    GatewayStats stats_{};  // bytes and blocked writes are the transport's: see stats()
 };
 
 }  // namespace obe::net

@@ -25,6 +25,7 @@
 #include "obe/net/protocol.hpp"
 #include "obe/net/socket.hpp"
 #include "support/engine_harness.hpp"
+#include "support/tcp_client.hpp"
 
 // The order gateway, over real TCP sockets on loopback.
 //
@@ -34,8 +35,10 @@
 // deterministic, and it is possible because the gateway is single-threaded by
 // design: nothing in it happens except inside poll().
 //
-// These run on whichever engine the build tests (the reference engine in the
-// passing suite), because the gateway's behaviour does not depend on it.
+// These run on the reference engine, because the gateway's behaviour does not
+// depend on the engine, and on whichever transport the build selects
+// (support/tcp_client.hpp): epoll in the passing suite, the hand-written
+// io_uring transport in the needs-your-code one. Nothing below knows which.
 
 namespace {
 
@@ -52,7 +55,7 @@ struct Keep {
 };
 
 using Publisher = net::MoldPacketizer<Keep>;
-using Gateway = net::OrderGateway<engine::ReferenceEngineImpl, Publisher>;
+using Gateway = net::OrderGateway<engine::ReferenceEngineImpl, Publisher, test::NetUnderTest>;
 
 constexpr Price kP = 1'000'000;
 constexpr Price kTick = 100;
@@ -150,6 +153,12 @@ class Client {
 
 class GatewayTest : public ::testing::Test {
  protected:
+    void SetUp() override {
+        if (!test::NetUnderTest::available()) {
+            OBE_UNAVAILABLE("the '" + std::string(test::NetUnderTest::kName) + "' transport");
+        }
+    }
+
     void start(const net::GatewayConfig& cfg = {}) {
         gateway = std::make_unique<Gateway>(publisher, cfg, [this] { return ++clock; });
         ASSERT_TRUE(gateway->engine().add_instrument(1, feed::Symbol::from("ACME"), ++clock));
@@ -239,6 +248,25 @@ TEST_F(GatewayTest, AcceptsConnectionsAndGivesEachItsOwnOwner) {
     EXPECT_EQ(orders[0].id, a);
     EXPECT_EQ(orders[1].id, b);
     EXPECT_NE(orders[0].owner, orders[1].owner);
+}
+
+// poll() says whether anything happened. The exchange's loop has other work
+// between turns (a heartbeat when the feed has been quiet), and a caller that
+// wants to sleep when idle has only this to go by.
+TEST_F(GatewayTest, PollSaysWhetherAnythingHappened) {
+    start();
+    Client ann = connect();
+    ASSERT_TRUE(pump_until([&] { return gateway->connections() == 1; }));
+    pump();
+    EXPECT_EQ(gateway->poll(20), 0U) << "nothing was happening";
+
+    ann.send(net::EnterOrder{.token = 1, .locate = 1, .side = Side::Buy, .qty = 100, .price = kP});
+    std::size_t served = 0;
+    for (int i = 0; i < 1'000 && gateway->stats().requests == 0; ++i) {
+        served += gateway->poll(20);
+    }
+    ASSERT_EQ(gateway->stats().requests, 1U);
+    EXPECT_GE(served, 1U) << "a request was served by a poll that said it did nothing";
 }
 
 TEST_F(GatewayTest, AnOrderIsAcceptedWithEveryFieldEchoed) {
@@ -722,6 +750,111 @@ TEST_F(GatewayTest, AClientThatStopsReadingIsDroppedAndTheOthersAreNot) {
 
     // All the while, and afterwards, the well-behaved client is served.
     EXPECT_NE(rest(good, Side::Buy, kP, 100), 0U);
+}
+
+// The report that shows a client to be too slow is a report like any other:
+// the order it speaks of is in the book. A gateway that only writes down the
+// orders whose reports it managed to queue forgets exactly that one, and it
+// rests in the book for good, owned by an id nobody will ever have again.
+TEST_F(GatewayTest, AClientDroppedForBeingSlowLeavesNoOrderBehind) {
+    start({.max_pending_output = std::size_t{16} * 1024});
+    Client slow = connect(4096);
+    ASSERT_TRUE(pump_until([&] { return gateway->connections() == 1; }));
+
+    // Buy orders that rest, each answered with an acceptance the client does
+    // not read. Requests are made 500 at a time and every byte of them is
+    // sent, in order, however the socket cuts them up.
+    engine::Token next_token = 0;
+    Packet pending;
+    const bool dropped = pump_until([&] {
+        if (gateway->stats().closed_slow == 0) {
+            for (int i = 0; pending.empty() && i < 500; ++i) {
+                ++next_token;
+                Packet one(net::kEnterOrderSize);
+                feed::encode(
+                    net::EnterOrder{.token = next_token,
+                                    .locate = 1,
+                                    .side = Side::Buy,
+                                    .qty = 100,
+                                    .price = kP - static_cast<Price>(next_token % 50) * kTick},
+                    one.data());
+                pending.insert(pending.end(), one.begin(), one.end());
+            }
+            const std::size_t took = slow.send_raw(pending);
+            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(took));
+        }
+        return gateway->stats().closed_slow != 0;
+    });
+    ASSERT_TRUE(dropped) << "accepted " << gateway->engine().stats().accepted << " orders";
+    EXPECT_EQ(gateway->connections(), 0U);
+    const std::uint64_t accepted = gateway->engine().stats().accepted;
+    ASSERT_GT(accepted, 100U) << "the limit was reached before there was anything to cancel";
+    EXPECT_EQ(gateway->engine().open_orders(), 0U)
+        << "an order outlived the connection that owned it";
+    EXPECT_EQ(gateway->stats().orders_cancelled_on_disconnect, accepted);
+    EXPECT_EQ(gateway->engine().best(1, Side::Buy), std::nullopt);
+}
+
+// The same for a replace that moves an order to a new id: the report that
+// trips the limit names the id the order has from now on.
+TEST_F(GatewayTest, AClientDroppedInTheMiddleOfReplacingLeavesNoOrderBehind) {
+    start({.max_pending_output = std::size_t{16} * 1024});
+    Client slow = connect(4096);
+    OrderId id = rest(slow, Side::Buy, kP, 100);
+    ASSERT_NE(id, 0U);
+
+    // One order, moved between two prices below where it started. Each move
+    // gives it the next id, which is what lets this test name the order
+    // without reading the answers: nothing else is being entered, and a
+    // request that is refused does not use an id up.
+    std::uint64_t moves = 0;
+    Packet pending;
+    const bool dropped = pump_until([&] {
+        if (gateway->stats().closed_slow == 0) {
+            for (int i = 0; pending.empty() && i < 500; ++i) {
+                Packet one(net::kReplaceOrderSize);
+                feed::encode(
+                    net::ReplaceOrder{.order_id = id,
+                                      .qty = 100,
+                                      .price = kP - static_cast<Price>(1 + moves % 2) * kTick},
+                    one.data());
+                pending.insert(pending.end(), one.begin(), one.end());
+                ++id;
+                ++moves;
+            }
+            const std::size_t took = slow.send_raw(pending);
+            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(took));
+        }
+        return gateway->stats().closed_slow != 0;
+    });
+    ASSERT_TRUE(dropped) << "replaced " << gateway->engine().stats().replaces << " times";
+    ASSERT_GT(gateway->engine().stats().replaces, 100U)
+        << "the replaces were not going through: the ids this test predicts are wrong";
+    EXPECT_EQ(gateway->engine().stats().rejected, 0U);
+    EXPECT_EQ(gateway->engine().open_orders(), 0U)
+        << "the order outlived the connection that owned it";
+    EXPECT_EQ(gateway->stats().orders_cancelled_on_disconnect, 1U);
+}
+
+// A connection that is being dropped is sent nothing more. The order was
+// accepted, the byte after it ended the connection in the same turn, and the
+// acceptance that turn had queued goes with the connection instead of to it.
+TEST_F(GatewayTest, AConnectionBeingDroppedIsSentNothingMore) {
+    start();
+    Client ann = connect();
+    ASSERT_TRUE(pump_until([&] { return gateway->connections() == 1; }));
+    Packet bytes(net::kEnterOrderSize + 1);
+    feed::encode(
+        net::EnterOrder{.token = 1, .locate = 1, .side = Side::Buy, .qty = 100, .price = kP},
+        bytes.data());
+    bytes.back() = static_cast<std::byte>('Z');  // not a request type
+    ASSERT_EQ(ann.send_raw(bytes), bytes.size());
+    EXPECT_TRUE(closed_by_gateway(ann));
+    EXPECT_EQ(gateway->stats().closed_protocol, 1U);
+    EXPECT_EQ(gateway->engine().stats().accepted, 1U) << "the order before the bad byte counted";
+    EXPECT_EQ(ann.buffered(), 0U) << "something was sent to a connection being dropped";
+    EXPECT_EQ(gateway->stats().bytes_out, 0U);
+    EXPECT_EQ(gateway->engine().open_orders(), 0U) << "and its order was cancelled";
 }
 
 TEST_F(GatewayTest, ABigBurstFromAClientThatIsReadingIsNotMistakenForSlowness) {

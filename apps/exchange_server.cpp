@@ -10,6 +10,8 @@
 //     --session NAME      market-data session name, up to 10 characters
 //     --symbols N         instruments to open, S00001 onwards (default 16)
 //     --engine NAME       which matching engine (default reference)
+//     --io NAME           how sockets are served: epoll (default) or uring
+//     --list-io           print the transport names and whether each can run
 //     --keep-orders       do not cancel a client's orders when it disconnects
 //     --max-pending N     bytes queued for a slow client before it is dropped
 //     --quiet             no statistics at exit
@@ -23,7 +25,8 @@
 // SIGINT or SIGTERM, then tells subscribers the session has ended.
 //
 // Exit status: 0 stopped by a signal, 1 usage or set-up error, 4 the chosen
-// engine is not written yet.
+// engine or transport is not written yet, 5 the chosen transport cannot run
+// on this system (--list-io says which can).
 
 #include <charconv>
 #include <chrono>
@@ -44,6 +47,7 @@
 #include "obe/net/moldudp.hpp"
 #include "obe/net/order_gateway.hpp"
 #include "obe/net/socket.hpp"
+#include "obe/net/transports.hpp"
 #include "obe/net/udp.hpp"
 #include "obe/util/format.hpp"
 #include "obe/util/todo.hpp"
@@ -66,6 +70,7 @@ struct Options {
     std::string md_interface = "127.0.0.1";
     std::string session = "OBE";
     std::string engine = "reference";
+    std::string io = "epoll";
     std::uint32_t symbols = 16;
     net::GatewayConfig gateway;
     bool quiet = false;
@@ -76,8 +81,9 @@ int usage(std::FILE* to, int status) {
                  "usage: exchange_server [--listen HOST:PORT] [--md HOST:PORT] "
                  "[--md-interface IP]\n"
                  "                       [--session NAME] [--symbols N] [--engine NAME] "
-                 "[--keep-orders]\n"
-                 "                       [--max-pending BYTES] [--quiet]\n");
+                 "[--io NAME]\n"
+                 "                       [--keep-orders] [--max-pending BYTES] [--quiet]\n"
+                 "       exchange_server --list-io\n");
     return status;
 }
 
@@ -98,10 +104,18 @@ struct PacketSender {
     }
 };
 
-template <class Impl>
+template <class Impl, class Net>
 int serve(const Options& opt) {
     using Publisher = net::MoldPacketizer<PacketSender>;
-    using Gateway = net::OrderGateway<Impl, Publisher>;
+    using Gateway = net::OrderGateway<Impl, Publisher, Net>;
+
+    if (!Net::available()) {
+        std::fprintf(stderr,
+                     "error: the '%.*s' transport cannot run here: the kernel is too old for "
+                     "it, or this system does not allow it\n",
+                     static_cast<int>(Net::kName.size()), Net::kName.data());
+        return 5;
+    }
 
     net::UdpSender socket(opt.md.host, opt.md.port, opt.md_interface);
     Publisher publisher(net::make_session(opt.session), PacketSender{&socket});
@@ -120,9 +134,10 @@ int serve(const Options& opt) {
     gateway.listen(opt.listen.host, opt.listen.port);
     std::printf("listening on %s:%u\n", opt.listen.host.c_str(),
                 static_cast<unsigned>(gateway.port()));
-    std::printf("market data to %s:%u, session '%s', %u symbols, engine %.*s\n",
+    std::printf("market data to %s:%u, session '%s', %u symbols, engine %.*s, io %.*s\n",
                 opt.md.host.c_str(), static_cast<unsigned>(opt.md.port), opt.session.c_str(),
-                opt.symbols, static_cast<int>(Impl::kName.size()), Impl::kName.data());
+                opt.symbols, static_cast<int>(Impl::kName.size()), Impl::kName.data(),
+                static_cast<int>(Net::kName.size()), Net::kName.data());
     std::fflush(stdout);
 
     // A heartbeat once a second when nothing else was published, so that a
@@ -165,6 +180,12 @@ int serve(const Options& opt) {
         line("bytes in", s.bytes_in);
         line("bytes out", s.bytes_out);
         line("writes a socket would not take", s.blocked_writes);
+        const std::uint64_t syscalls = gateway.transport().stats().syscalls;
+        line("system calls while serving", syscalls);
+        if (s.requests != 0) {
+            std::printf("  %-32s %.2f\n", "system calls per request",
+                        static_cast<double>(syscalls) / static_cast<double>(s.requests));
+        }
         line("orders cancelled on disconnect", s.orders_cancelled_on_disconnect);
         line("orders accepted", e.accepted);
         line("requests rejected", e.rejected);
@@ -207,6 +228,16 @@ int run(int argc, char** argv) {
             opt.session = argv[++i];
         } else if (arg == "--engine" && has_next) {
             opt.engine = argv[++i];
+        } else if (arg == "--io" && has_next) {
+            opt.io = argv[++i];
+        } else if (arg == "--list-io") {
+            net::for_each_transport([]<class Net>(std::type_identity<Net>) {
+                std::printf("%-8.*s %-20s %.*s\n", static_cast<int>(Net::kName.size()),
+                            Net::kName.data(),
+                            Net::available() ? "(can run here)" : "(cannot run here)",
+                            static_cast<int>(Net::kDescription.size()), Net::kDescription.data());
+            });
+            return 0;
         } else if (arg == "--symbols" && has_value) {
             opt.symbols = static_cast<std::uint32_t>(value);
             ++i;
@@ -231,11 +262,18 @@ int run(int argc, char** argv) {
     sigaction(SIGTERM, &action, nullptr);
 
     int status = 1;
-    const bool known = engine::with_engine(
-        opt.engine, [&]<class Impl>(std::type_identity<Impl>) { status = serve<Impl>(opt); });
+    bool known_io = false;
+    const bool known = engine::with_engine(opt.engine, [&]<class Impl>(std::type_identity<Impl>) {
+        known_io = net::with_transport(
+            opt.io, [&]<class Net>(std::type_identity<Net>) { status = serve<Impl, Net>(opt); });
+    });
     if (!known) {
         std::fprintf(stderr, "error: no engine called '%s'. Try flow_gen --list.\n",
                      opt.engine.c_str());
+        return 1;
+    }
+    if (!known_io) {
+        std::fprintf(stderr, "error: no transport called '%s'. Try --list-io.\n", opt.io.c_str());
         return 1;
     }
     return status;

@@ -262,7 +262,10 @@ here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
 | Pipeline | `tests/pipeline/pipeline_test.cpp` | three threads publish exactly what one thread publishes, on any queue, with any capacity, on bad input, and when a stage throws |
 | Seqlock | `tests/util/seqlock_test.cpp` | a reader never sees a value nobody stored |
 | Wire formats | `tests/net/protocol_test.cpp`, `moldudp_test.cpp` | every order-entry message at hand-built offsets; packet bytes; loss, duplication and reordering of packets |
-| Gateway | `tests/net/gateway_test.cpp` | partial reads, mid-message disconnects, bad input, slow clients, clients that pause and resume, connection limits and identities, over real loopback sockets |
+| Gateway | `tests/net/gateway_test.cpp` | partial reads, mid-message disconnects, bad input, slow clients and what becomes of their orders, clients that pause and resume, connection limits and identities, over real loopback sockets |
+| Transport | `tests/net/transport_test.cpp` | the contract between the gateway and the sockets: order, backlog, queueing behind a send under way, deaths reported once, ids reused at once, closing with output queued, nothing leaving before a flush |
+| Output buffer | `tests/net/out_buffer_test.cpp` | bytes out in the order they went in, however much is taken at a time; the memory held never more than twice the backlog |
+| io_uring rings | `tests/net/uring_test.cpp` | user data and results come back; a full queue; overflow loses nothing, with or without a wait; cancelling gives two completions; closing a descriptor does not end what waits on it |
 | Load measurement | `tests/net/open_loop_test.cpp` | due times neither drift nor overflow; a stall is charged to every request due during it, shown against a send-and-wait generator in simulated time |
 | The three programs | `scripts/gateway_smoke.sh` | orders in over TCP, market data out over UDP, the subscriber's book consistent and gap-free |
 | Simulator scenario | `tests/sim/sim_scenario_test.cpp` | each rule of the fill model on hand-built messages: who is ahead, the three ways a quote trades, refusals, halts, latency, every money figure |
@@ -313,15 +316,24 @@ bodies are left out until they are written.
 | Snapshot support for the hand-written engine | the five `Restorable` functions, in `include/obe/engine/matching_engine.hpp` | optional: see below |
 | Tick store: varints, the file, the reference codec, the profile | `include/obe/util/varint.hpp`, `include/obe/store/` | written |
 | Compressing tick codec | `include/obe/store/delta_codec.hpp` | **to write** |
+| Gateway session logic, the transport contract, the epoll transport and its output buffer, the io_uring rings | `include/obe/net/order_gateway.hpp`, `transport.hpp`, `epoll_transport.hpp`, `out_buffer.hpp`, `uring.hpp` | written |
+| io_uring transport | `include/obe/net/uring_transport.hpp` | **to write** |
 
 Each "to write" header holds the interface, the questions to settle and where
 the measurements that settle them come from. Their tests are built into
 second executables (`obe_hand_written_tests` for the containers,
 `obe_hand_written_engine_tests` for the engine,
 `obe_hand_written_concurrency_tests` for the ring) from the same sources as the
-reference tests, and carry the `ctest` label `needs-your-code`. The strategy
+reference tests, and carry the `ctest` label `needs-your-code` and, in
+`ctest`'s own listing, the prefix `hand_written.` on their names. The prefix
+is not decoration. A test that does not depend on the hand-written part has
+the same name in both executables, `ctest` keeps labels by name, and of two
+tests with one name the first ended up carrying the label of the second: a
+handful of finished tests were being left out of the "everything that is
+finished" run below until the names were made distinct. The strategy
 has an executable of its own, `obe_hand_written_sim_tests`, under the same
-label, and the tick codec has `obe_hand_written_store_tests`:
+label, the tick codec has `obe_hand_written_store_tests`, and the io_uring
+transport has `obe_hand_written_net_tests`:
 
 ```sh
 ctest --preset debug -LE needs-your-code     # everything that is finished
@@ -425,6 +437,23 @@ Then the simplest design that is correct, measured, and after that one
 experiment at a time in [`optimization-log.md`](optimization-log.md), each
 with bytes per tick and ticks per second before and after, and the same file
 through `zstd` beside them.
+
+### 6.10 io_uring transport
+
+*(yours)*
+
+The comparison the stretch idea asks for is between two transports, and one
+of them is the point of the exercise: the epoll one is the familiar
+mechanism, and the io_uring one is where the thinking is (section 10.6). So
+the rings, the contract, the gateway on top and the reference are done, and
+the transport is left.
+
+It is the hand-written part with the least margin for a mistake that tests
+cannot see. The tests run under AddressSanitizer, and AddressSanitizer does
+not see a write the kernel makes into memory the program has already freed.
+The questions in the header about what happens to a connection's buffers
+when it is closed with operations in flight are the ones to answer on paper
+before any code.
 
 ## 7. Phase 4 structure
 
@@ -887,10 +916,12 @@ type byte is fatal for the connection: nothing says where the next message
 starts.
 
 **One thread, driven by epoll.** A request is read, decoded and handed to the
-engine in one call; the engine's reports land in the output buffers of the
-connections they belong to before that call returns; at the end of each turn of
-the loop every buffer that gained something is written, with one `send` per
-connection. Nothing is locked because nothing is shared. The cost of that
+engine in one call; the engine's reports are queued for the connections they
+belong to before that call returns; at the end of each turn of the loop
+everything queued is written, with one `send` per connection. Nothing is
+locked because nothing is shared. (The reading and writing themselves are
+behind an interface since section 10.6 was added; what is described here is
+the default, `EpollTransport`.) The cost of that
 simplicity is that one core does everything; the threads and queues of section
 9 are what would be put between the gateway and the engine to change that.
 
@@ -904,7 +935,17 @@ The three things a TCP server has to get right:
 2. **Slow clients.** A write never blocks. What a socket will not take stays in
    the connection's buffer and the socket is watched for writability. A client
    whose backlog passes a limit is disconnected: it must not be able to grow
-   the server's memory, or delay anybody else, by not reading.
+   the server's memory, or delay anybody else, by not reading. Two details
+   took a second reading to get right. The buffer has to give back what has
+   been sent even while something is left (`out_buffer.hpp`): a client that
+   reads a little slower than it is written to never empties it, never
+   reaches the limit either, and would otherwise make it hold every byte
+   ever sent. And the report that shows a client to be too slow is itself
+   about an order, which is in the book by then: the gateway records an
+   owner's orders whether or not their reports could be queued, or that one
+   order would outlive its connection, owned by an id that is never given
+   out again. A connection being dropped is sent nothing more; what the turn
+   had queued for it is discarded with it.
 3. **Disconnects at any moment.** A connection that closes in the middle of a
    message loses that message and nothing else. Its resting orders are
    cancelled (configurable), in id order so that the market data this
@@ -1020,6 +1061,144 @@ compete for the same cores.
 6. **The three programs together** (`scripts/gateway_smoke.sh`, a `ctest`
    entry): every request acknowledged, the subscriber sees the whole feed with
    no gap and rebuilds a consistent book, the server shuts down cleanly.
+
+### 10.6 Readiness and completion: the transport (`transport.hpp`)
+
+The gateway is two things that have nothing to do with each other. One is the
+session: which bytes make a request, what the engine is asked, whose report
+goes where, when a client is too slow to keep. The other is the plumbing:
+accepting sockets, moving bytes through them, and finding out which of a few
+thousand has something to say. The fourth stretch idea asks for the plumbing
+to be done a second way, with `io_uring`, and compared with epoll. So the
+line between the two was drawn, and the plumbing is now a template parameter
+of the gateway.
+
+| File | What it is |
+|---|---|
+| `transport.hpp` | the contract, as a comment and a concept: `listen`, `poll`, `send`, `flush`, `flush_all`, `unsent`, `close`, and the three things a transport tells its handler |
+| `epoll_transport.hpp` | `EpollTransport`, the reference: what the gateway used to do itself |
+| `out_buffer.hpp` | `OutBuffer`: one connection's unsent output for a readiness transport. It may move its bytes, which is exactly what a completion transport's queue may not do |
+| `uring.hpp` | `Uring`: the two rings and the three system calls of `io_uring`, with nothing in between |
+| `uring_transport.hpp` | `UringTransport`. **Written by hand** (section 6.10) |
+| `transports.hpp` | the transports by name, for `--io` |
+
+**Two models.** With readiness, the program asks which sockets could be read
+or written without waiting, and then does the reading and writing itself, one
+system call per socket. With completion, it tells the kernel in advance what
+to do ("receive from this socket into this buffer") for many sockets at once
+and collects the results later; requests and results travel through two rings
+of memory shared with the kernel, so a whole turn of the loop can cost one
+system call however many sockets were busy.
+
+What that buys is system calls. What it costs is ownership. A readiness
+transport owns every buffer all the time: `recv` copies into memory the
+program picked at that instant, and one read buffer serves every connection.
+A completion transport names its buffer when it asks, before anything has
+arrived, and from then until the result is collected the kernel may write
+there at any moment. The memory may not move and may not be freed, and
+closing the socket does not end the wait: a test in
+`tests/net/uring_test.cpp` closes a descriptor with a receive waiting on it,
+then sends to the other end, and the bytes arrive in the buffer all the same.
+Nearly every design question in `uring_transport.hpp` is a form of that one
+fact.
+
+**The contract was written so that both fit.** Four points in it are there
+because of the second model.
+
+1. **`send` copies and returns; delivery is the transport's business.** The
+   gateway no longer holds output buffers. A readiness transport could have
+   lent its buffer to the caller; a completion one cannot, because the buffer
+   a send is reading from has to stay still while more is queued behind it.
+2. **`flush(id)` is immediate.** The gateway judges a client too slow by how
+   much is queued for it and not yet taken by the kernel, and it must not
+   mistake a client that sent a large burst and is reading its answers for
+   one that has stopped. So before judging it asks the transport to try the
+   socket now, and reads the backlog again. With epoll that is a `send`. With
+   completions it means learning the outcome of one operation out of turn,
+   from inside a callback, which is the hardest thing the contract asks of a
+   completion transport, and deliberately so: without it the slow-client rule
+   would have to be a different rule for each transport.
+3. **`close(id)` returns at once and the id may be reused at once.** What
+   the transport then does about operations still in flight for the old
+   connection, and where their memory lives until they end, is its own
+   affair. The tests reuse an id thirty times over with the old client still
+   talking.
+4. **`send` only queues.** Nothing is offered to the kernel before a flush,
+   so what was queued for a connection that is closed first never leaves.
+   For epoll that is how it happened to work. For completions it is a
+   constraint worth stating: a submission entry that has been filled in
+   cannot be taken back, so a transport that filled one in at `send` would
+   have no way to honour a `close` that came before the flush.
+
+**What is measured, and what is not yet.** Each transport counts its own
+crossings into the kernel. `transport_bench` runs a server thread that echoes
+to a client thread holding K connections, a round on every connection at a
+time, and reports requests per second and system calls per request.
+`exchange_server --io NAME` prints the same count at exit, and with
+`load_gen` gives the latency curve of section 10.4 for either transport.
+
+For epoll the count follows from the code: a request costs a `recv` and a
+`send`, and the `epoll_wait` that found it is shared by everything ready in
+the same turn, so 3 for a request that arrives alone and 2 + 1/K when K
+arrive together, and that is the count the benchmark reports. No number
+exists for the hand-written transport, and no timing taken in the build
+sandbox means anything: the comparison the stretch idea asks for is to be
+made on real hardware, once the transport is written. The
+prediction worth writing down before measuring is in the benchmark's header:
+system calls per request should fall as 1/K, and requests per second should
+move much less than that, because on loopback the kernel's TCP work per
+packet outweighs the cost of entering it.
+
+**How it is tested.** `tests/net/transport_test.cpp` holds the contract
+against a transport over real loopback sockets, on one thread, with the test
+as every client: ids chosen by the handler; bytes in order however they were
+cut; no piece above the read chunk; a client that does not read, and the
+backlog draining when it does; more queued behind a send that is under way,
+400 times, with every byte checked on arrival; sends and flushes from inside
+callbacks; a death reported once, by whichever of the two ways finds it; an
+id reused the moment its connection is closed; a connection closed with a
+backlog; and a transport destroyed with connections open and output queued.
+The whole gateway suite of section 10.5 then runs on the same transport.
+Both files are built twice: on `EpollTransport` in the passing suite, and on
+`UringTransport` under `needs-your-code`. `uring_test.cpp` covers the rings
+themselves.
+
+Two things about these tests are there because of what they cannot do.
+
+1. **They skip where `io_uring` is not allowed, and that must not become an
+   excuse.** A ring with a bug in it would also report that it cannot be
+   used, and every one of its tests would be skipped. So when the build is
+   configured, a small program that shares no code with the library
+   (`cmake/io_uring_probe.cpp`) puts one operation through a ring of its own.
+   Where that works, a ring or a transport that says "not here" fails its
+   tests instead of skipping them.
+2. **A sanitizer cannot see the kernel.** The mistake that matters most in a
+   completion transport is freeing or moving a buffer while the kernel still
+   reads from it or writes to it. AddressSanitizer does not see what the
+   kernel does, and worse, it keeps freed memory aside with its old contents
+   for a while, so the kernel finds the right bytes in the wrong place and
+   everything passes. The hand-written transport's tests are therefore run a
+   second time with that quarantine switched off
+   (`hand_written_net_tests_without_quarantine`), so that freed memory is
+   reused or unmapped at once and the mistake has a chance of showing as
+   wrong bytes or a failed send. It remains a chance: the question has to be
+   settled by reasoning about lifetimes, and the header says so.
+
+**One thing about the rings that the first version had wrong.** When the
+completion queue is full the kernel does not refuse new work, as kernels of
+a few years ago did. It keeps the completions that do not fit on a list of
+its own, sets a flag in the shared memory, and moves them into the ring only
+during a call that asks for completions. A wrapper that enters the kernel
+only when it has something to submit or something to wait for, which is what
+makes an idle turn free, never makes such a call in a loop that polls without
+waiting, and the kept completions are never heard of: on the kernel this was
+built on, sixteen of twenty-four operations stayed there until a call with a
+timeout came along. The ring now reads the flag and asks. The test that
+existed passed all the while, because it happened to wait; the one that
+catches it never waits. On older kernels an accept through the ring on a
+non-blocking listener does not wait either, so the listener a ring accepts
+on is made blocking; that one is taken from the kernel's history and could
+not be reproduced on the kernel at hand.
 
 ## 11. Market-making simulator (`include/obe/sim`)
 
@@ -1841,6 +2020,21 @@ revisit.
     The store then opens as recovered and nothing rewrites the file. A tool
     that rebuilt the index in place would be a few lines; it would also be
     the only code here that modifies a store after it was written.
+29. **The transport holds the output, not the gateway.** `send` copies the
+    bytes into the transport's queue. Encoding straight into a buffer the
+    transport lends would save a copy of a few dozen bytes per response, and
+    would let the caller hold a pointer into memory that a completion
+    transport may have handed to the kernel. The copy is the price of a
+    contract that both models can honour.
+30. **io_uring through raw system calls, not liburing.** There is no
+    dependency to install, and the three calls and two rings are short
+    enough to read whole. liburing would replace `uring.hpp` and be better
+    tested than it. Nothing above that file would change.
+31. **A transport is chosen at compile time and named at run time.** The
+    gateway is a template over it, like the engine and the market-data sink,
+    and `--io` picks among the instantiations. A virtual interface would be
+    one indirect call per `send` and per event, which is nothing next to a
+    system call; it was left as a template for consistency, not for speed.
 
 ## 15. Known limits
 
@@ -1887,3 +2081,17 @@ revisit.
 15. The tick store is not connected to the live programs. `tick_store record`
     replays a file. `md_listen` could record what it receives through the
     same `TickRecorder`, and does not.
+16. `io_uring` needs Linux 5.11 or later and a system that allows it:
+    container runtimes and hardened kernels often do not, and then only the
+    epoll transport runs. The rings use the plain operations (accept, recv,
+    send, close, cancel) and none of what makes io_uring fast in earnest:
+    multishot operations, buffer rings, registered files, submission-queue
+    polling. Those are listed in the transport's header as experiments.
+17. Only the order gateway has a second transport. The UDP publisher and the
+    load generator use ordinary sockets.
+18. The rings have been run on one kernel, 6.18. Two things in them are
+    written for older kernels from the kernel's history and not from a run:
+    a submission refused with `-EBUSY` while completions are backed up, and
+    an accept on a non-blocking listener that does not wait. Run
+    `obe_net_tests --gtest_filter='Uring*'` on the kernel you intend to
+    measure on before believing either.

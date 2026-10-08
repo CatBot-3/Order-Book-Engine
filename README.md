@@ -30,6 +30,7 @@ did not help.
 | 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; nothing measured yet |
 | 10 | Self-match prevention and more order types (stretch idea 2) | done in the reference engine: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot; the pooled engine has them to write |
 | 11 | Compressed tick store (stretch idea 3) | the file format, queries by time, recovery of an unfinished store, `tick_store` and `tick_bench` done on a codec that does not compress; the compressing codec is being written; nothing recorded from a real file yet |
+| 12 | io_uring gateway against epoll (stretch idea 4) | the gateway runs on any transport; the epoll transport, the io_uring rings (raw system calls), `transport_bench` and `exchange_server --io` done; the io_uring transport itself is being written; nothing measured yet |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -51,7 +52,7 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 
  [bench]  latency histogram, hardware counters, report      [gen]  seeded synthetic order flow
 
- as an exchange:    clients ──TCP──> [net] epoll gateway ──> [engine]
+ as an exchange:    clients ──TCP──> [net] gateway on epoll or io_uring ──> [engine]
                     subscribers <──UDP── [net] MoldUDP64-style packets <── market data
 
  as a simulation:   file ──> [feed] ──> [sim] fill model + strategy ──> [book]
@@ -70,14 +71,14 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 | `include/obe/book/` | `BookManager`, `Book`, the reference and optimized containers, concepts, the named implementations, hash listener |
 | `include/obe/engine/` | the matching-engine contract, `ReferenceEngine`, the hand-written `MatchingEngine`, `ItchFeedWriter`, the round-trip comparison |
 | `include/obe/pipeline/` | the replay as three threads joined by queues; the top-of-book board |
-| `include/obe/net/` | the order-entry protocol, `OrderGateway` on epoll, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
+| `include/obe/net/` | the order-entry protocol, `OrderGateway` over a transport, the epoll transport, the io_uring rings and the hand-written io_uring transport, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
 | `include/obe/sim/` | the market-making simulator: fill model, the simple strategies, the hand-written Avellaneda-Stoikov strategy, volatility estimate, report |
 | `include/obe/journal/` | the write-ahead journal: records, writer, a reader that tells a torn tail from damage, replay, snapshots, the file layer, recovery from files |
 | `include/obe/store/` | the tick store: the codec contract and the reference codec, the hand-written compressing codec, the block file with its index, writer, recorder and reader, the tick profile |
 | `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock`; CRC-32, varints |
 | `include/obe/gen/` | seeded generators: order flow for the engine, a raw ITCH stream for fixtures, and ticks for the store |
 | `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen`; `mm_sim`; `engine_journal`; `tick_store` |
-| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `journal_bench` (journaling and recovery), `tick_bench` (tick codecs and block sizes), `micro_bench` (Google Benchmark) |
+| `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `journal_bench` (journaling and recovery), `tick_bench` (tick codecs and block sizes), `transport_bench` (system calls per request, by transport), `micro_bench` (Google Benchmark) |
 | `tests/`, `fuzz/` | unit, scenario, golden, differential, property, round-trip, recovery and tick-store tests; libFuzzer targets for the parser, the journal and the tick store |
 | `scripts/` | data fetch, independent message counter, benchmark runner, book and engine comparison, before/after tables, latency curve, PGO build, the journal crash test, the tick store smoke test |
 | `docs/` | [`design.md`](docs/design.md), [`benchmark-method.md`](docs/benchmark-method.md), [`optimization-log.md`](docs/optimization-log.md) |
@@ -285,6 +286,24 @@ F=data/01302019.NASDAQ_ITCH50
     $B/bench/tick_bench --file $F --cpu 4 --json results/ticks.json
     ```
 
+13. **epoll against io_uring.** The gateway is written once and runs on
+    either. `transport_bench` shows the mechanism: how many times the server
+    crosses into the kernel per request, as the number of busy connections
+    grows. The latency curve of step 9, taken once with each transport, shows
+    whether that matters. Until the io_uring transport is written, `--io
+    uring` exits with status 4.
+
+    ```sh
+    $B/apps/exchange_server --list-io
+    $B/bench/transport_bench --cpus 2,4 --json results/transports.json
+
+    $B/apps/exchange_server --io uring --listen 127.0.0.1:9001 --md 127.0.0.1:9002 &
+    $B/apps/load_gen --connect 127.0.0.1:9001 --connections 16 --cpu 4 \
+        --rate 1000,5000,20000,50000,100000 --seconds 10 --json results/load_uring.json
+    ```
+
+    `exchange_server` prints its system calls per request when it stops.
+
 ## Matching rules
 
 These are design choices, stated here so nobody has to infer them from the
@@ -356,7 +375,7 @@ number of connections and the CPUs each program was pinned to.
 | Property | long seeded random sequences against a `std::map` model; for the engine: never crossed, shares conserved, price-time order, determinism, on flows with and without icebergs, post-only orders and self-match prevention |
 | Round trip | the engine's published feed, through the feed handler, rebuilds the engine's book |
 | Concurrency | each queue: every item once, in order, intact, between two threads; the pipeline against the single-threaded replay; the seqlock against torn reads |
-| Network | the gateway over real loopback sockets: partial reads, mid-message disconnects, bad input, slow and paused clients; the feed with packets lost, repeated and reordered; the load generator's schedule against a server that stalls, in simulated time |
+| Network | the gateway over real loopback sockets: partial reads, mid-message disconnects, bad input, slow and paused clients; the feed with packets lost, repeated and reordered; the load generator's schedule against a server that stalls, in simulated time; the contract between the gateway and its sockets, held against each transport: order, backlog, more queued behind a send under way, ids reused at once, closing with output queued |
 | Simulation | each rule of the fill model on hand-built messages; over generated markets, the queue ahead of every quote against the test's own copy of the orders, and the profit recounted from the fills |
 | Recovery | an engine rebuilt from its journal, or from a snapshot and the journal after it, holds, said and goes on to say exactly what the original did; a journal cut anywhere recovers to the last whole record; the real program, killed repeatedly with `SIGKILL` in the middle of writes, ends with the journal of a run that was never killed |
 | Tick store | each codec gives back every tick, likely or not, and reads arbitrary bytes without leaving them; ranges of time against a filter over the plain list; a store that was never finished, cut at every byte, or changed one bit at a time never yields a tick that was not written; an index that checks out and lies is not believed; the real program against a fresh replay of the feed |
@@ -396,6 +415,9 @@ number of connections and the CPUs each program was pinned to.
     no trades. It is one stream in time order, so a query for one security
     reads every block in its range of time. No size or speed is quoted for
     it: nothing has been recorded from a real day.
-11. Linux only, GCC and Clang only.
+11. Linux only, GCC and Clang only. The io_uring transport needs Linux 5.11
+    and a system that allows io_uring; where it is refused, the gateway runs
+    on epoll, the io_uring tests skip themselves, and `--io uring` exits with
+    status 5. The rings have only been run on one kernel (6.18).
 
 This project is not affiliated with or endorsed by Nasdaq.

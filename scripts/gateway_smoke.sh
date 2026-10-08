@@ -14,7 +14,8 @@
 #   scripts/gateway_smoke.sh <exchange_server> <load_gen> <md_listen> [workdir] [exchange_server options...]
 #
 # Exit status: 0 all of that held, 1 something did not, 4 the engine named
-# with --engine is not written yet.
+# with --engine, or the transport named with --io, is not written yet, 5 the
+# transport named with --io cannot run on this system.
 set -uo pipefail
 
 SERVER="$1"
@@ -67,8 +68,8 @@ if ! wait_for "$SERVER_LOG" "^listening on" "$SERVER_PID"; then
     status=$?
     cat "$SERVER_LOG" >&2
     SERVER_PID=""
-    if [[ "$status" -eq 4 ]]; then
-        exit 4
+    if [[ "$status" -eq 4 || "$status" -eq 5 ]]; then
+        exit "$status"
     fi
     echo "error: exchange_server did not start" >&2
     exit 1

@@ -58,6 +58,10 @@ class Fd {
         }
     }
 
+    // Gives the descriptor up without closing it: closing is now the
+    // caller's to do.
+    [[nodiscard]] int release() noexcept { return std::exchange(fd_, -1); }
+
  private:
     int fd_ = -1;
 };
@@ -111,6 +115,16 @@ inline void set_nonblocking(int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         throw std::runtime_error(errno_text("cannot make a socket non-blocking"));
+    }
+}
+
+// The opposite. For a socket whose waiting is done by somebody else: an
+// io_uring accept on a non-blocking listener does not wait on older kernels
+// (uring.hpp, prep_accept).
+inline void set_blocking(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+        throw std::runtime_error(errno_text("cannot make a socket blocking"));
     }
 }
 

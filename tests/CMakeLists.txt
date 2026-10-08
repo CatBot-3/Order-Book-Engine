@@ -9,10 +9,24 @@ function(obe_add_test name)
   add_executable(${name} ${ARG_SOURCES})
   target_link_libraries(${name} PRIVATE obe::obe GTest::gtest GTest::gmock GTest::gtest_main)
   target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  # Several suites are built twice from the same sources, once for the passing
+  # build and once for a hand-written part, and a test that does not depend on
+  # the part has the same name in both. ctest keeps its properties by name: of
+  # two tests with one name, the first ends up with the labels of the second,
+  # and a finished test would be left out of `-LE needs-your-code`. So the
+  # hand-written copies carry a prefix and every name is its own.
+  set(prefix "")
+  if("needs-your-code" IN_LIST ARG_LABELS)
+    set(prefix "hand_written.")
+  endif()
   # The timeout turns a container that has stopped making progress (an
   # open-addressing table clogged with deleted markers, say) into a failure
   # instead of a hung test run.
-  gtest_discover_tests(${name} DISCOVERY_TIMEOUT 60 PROPERTIES LABELS "${ARG_LABELS}" TIMEOUT 300)
+  gtest_discover_tests(
+    ${name}
+    TEST_PREFIX "${prefix}"
+    DISCOVERY_TIMEOUT 60
+    PROPERTIES LABELS "${ARG_LABELS}" TIMEOUT 300)
 endfunction()
 
 # Everything that is complete. These pass on a fresh clone.
@@ -86,7 +100,54 @@ obe_add_test(
   obe_net_tests
   LABELS unit
   SOURCES net/protocol_test.cpp net/moldudp_test.cpp net/udp_test.cpp net/gateway_test.cpp
-          net/open_loop_test.cpp)
+          net/open_loop_test.cpp net/out_buffer_test.cpp net/transport_test.cpp net/uring_test.cpp)
+
+# The transport contract and the whole gateway again, on the hand-written
+# io_uring transport (stretch idea 4). They skip themselves where the kernel
+# or a sandbox does not allow io_uring, so look at the count of tests that
+# ran, not only at the colour.
+obe_add_test(obe_hand_written_net_tests LABELS needs-your-code SOURCES net/transport_test.cpp
+             net/gateway_test.cpp)
+target_compile_definitions(obe_hand_written_net_tests PRIVATE OBE_TEST_URING)
+
+# Does io_uring work on the machine this is being configured on? A small
+# program that shares no code with the library finds out, once. Where it does
+# work, a ring or a transport that says "I cannot run here" fails its tests
+# instead of skipping them: otherwise a broken one could excuse itself. The
+# answer is cached with the build directory; configure again after moving to
+# a system where the answer is different (cmake -U 'OBE_IO_URING_*' ...).
+if(NOT CMAKE_CROSSCOMPILING)
+  try_run(
+    OBE_IO_URING_PROBE_EXIT OBE_IO_URING_PROBE_BUILT
+    "${CMAKE_CURRENT_BINARY_DIR}/io_uring_probe" "${PROJECT_SOURCE_DIR}/cmake/io_uring_probe.cpp"
+    CXX_STANDARD 20)
+  if(OBE_IO_URING_PROBE_BUILT AND "${OBE_IO_URING_PROBE_EXIT}" STREQUAL "0")
+    message(STATUS "io_uring works here: its tests will fail, not skip, if it stops working")
+    target_compile_definitions(obe_net_tests PRIVATE OBE_IO_URING_WORKS_HERE)
+    target_compile_definitions(obe_hand_written_net_tests PRIVATE OBE_IO_URING_WORKS_HERE)
+  else()
+    message(STATUS "io_uring does not work here: its tests will skip themselves")
+  endif()
+endif()
+
+# The hand-written transport's tests once more, with the sanitizer told to
+# hand freed memory straight back to the allocator. AddressSanitizer normally
+# keeps freed memory aside, untouched, for a while (its "quarantine"). That is
+# what lets it catch the program's own use of freed memory, and it is also
+# what hides the one mistake that matters most here: a buffer freed or moved
+# while the kernel is still reading from it keeps its old contents in
+# quarantine, the kernel sends the right bytes from the wrong place, and
+# every test passes. Without the quarantine the memory is reused or unmapped
+# at once, and the same mistake shows up as wrong bytes or a failed send.
+#
+# Where io_uring cannot be used every test in it skips itself, and the run is
+# reported as skipped and not as passed.
+add_test(NAME hand_written_net_tests_without_quarantine COMMAND obe_hand_written_net_tests)
+set_tests_properties(
+  hand_written_net_tests_without_quarantine
+  PROPERTIES LABELS "needs-your-code" TIMEOUT 600 ENVIRONMENT
+             "ASAN_OPTIONS=quarantine_size_mb=0:thread_local_quarantine_size_kb=0"
+             SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
 # The market-making simulator: the fill model on hand-built messages, its
 # accounting over generated flow, and the strategies. The Avellaneda-Stoikov
@@ -300,6 +361,18 @@ if(OBE_BUILD_APPS AND OBE_BASH)
   # They bind loopback ports; let nothing else run beside them.
   set_tests_properties(gateway_smoke PROPERTIES LABELS "integration" RUN_SERIAL TRUE)
 
+  # The same three programs with the exchange on the hand-written io_uring
+  # transport. Status 5 is the exchange saying that io_uring cannot be used
+  # on this system, which is nothing a test can hold against it.
+  add_test(
+    NAME gateway_uring_smoke
+    COMMAND
+      "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/gateway_smoke.sh"
+      $<TARGET_FILE:exchange_server> $<TARGET_FILE:load_gen> $<TARGET_FILE:md_listen>
+      "${CMAKE_CURRENT_BINARY_DIR}" --io uring)
+  set_tests_properties(gateway_uring_smoke PROPERTIES LABELS "needs-your-code" RUN_SERIAL TRUE
+                                                      SKIP_RETURN_CODE 5)
+
   add_test(
     NAME hand_written_engine_gateway_smoke
     COMMAND
@@ -382,4 +455,16 @@ if(OBE_BUILD_BENCH)
   add_test(NAME tick_bench_delta_smoke COMMAND tick_bench --codec delta --ticks 30000 --queries
                                                50 --runs 1)
   set_tests_properties(tick_bench_delta_smoke PROPERTIES LABELS "needs-your-code")
+endif()
+
+# The transport benchmark runs end to end and every answer is the request it
+# answers. A few thousand requests: the timings mean nothing here.
+if(OBE_BUILD_BENCH)
+  add_test(NAME transport_bench_smoke COMMAND transport_bench --io epoll --connections 1,8
+                                              --requests 4000 --runs 1)
+  set_tests_properties(transport_bench_smoke PROPERTIES LABELS "integration")
+  add_test(NAME transport_bench_uring_smoke COMMAND transport_bench --io uring --connections 1,8
+                                                    --requests 4000 --runs 1)
+  set_tests_properties(transport_bench_uring_smoke PROPERTIES LABELS "needs-your-code"
+                                                              SKIP_RETURN_CODE 5)
 endif()
