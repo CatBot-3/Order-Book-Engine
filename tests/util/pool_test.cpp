@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -169,6 +171,36 @@ TYPED_TEST(PoolTest, ASlabOfOneStillWorks) {
     pool.deallocate(c);
     pool.deallocate(d);
     EXPECT_EQ(pool.in_use(), 0U);
+}
+
+// The constructor's comment promises that 0 objects per slab is taken as 1. A
+// pool that took it literally would make empty slabs and have nothing to hand
+// out.
+TYPED_TEST(PoolTest, ZeroObjectsPerSlabIsTakenAsOne) {
+    Pool<TypeParam> pool(0);
+    void* a = pool.allocate();
+    void* b = pool.allocate();
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_NE(a, b);
+    EXPECT_EQ(pool.capacity(), 2U) << "two slabs of one object each";
+    this->fill(a, 1);
+    this->fill(b, 2);
+    EXPECT_TRUE(this->intact(a, 1));
+    EXPECT_TRUE(this->intact(b, 2));
+    pool.deallocate(a);
+    pool.deallocate(b);
+    EXPECT_EQ(pool.in_use(), 0U);
+}
+
+// A slab too large to describe in a size_t is "out of memory", not a small
+// slab with a huge loop over it. (Two thirds of 2^64 bytes is large enough to
+// wrap the multiplication for every element type here.)
+TYPED_TEST(PoolTest, ASlabTooLargeToExistIsOutOfMemory) {
+    Pool<TypeParam> pool(std::numeric_limits<std::size_t>::max() / 3 * 2);
+    EXPECT_THROW(static_cast<void>(pool.allocate()), std::bad_alloc);
+    EXPECT_EQ(pool.in_use(), 0U);
+    EXPECT_EQ(pool.capacity(), 0U);
 }
 
 // Model-based test: random allocations and frees, with every live slot's

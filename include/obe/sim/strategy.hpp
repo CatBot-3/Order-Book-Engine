@@ -51,14 +51,21 @@ concept Strategy = requires(S& strategy, const MarketView& view) {
 // A dollar amount as a Price, rounded down (for a bid) or up (for an ask) to a
 // whole price unit. A result of a formula that should land exactly on a price
 // can come out a hair to either side of it; the small tolerance stops that
-// from costing a whole unit, and then a whole tick. Amounts below zero give 0.
+// from costing a whole unit, and then a whole tick. Amounts below zero (and
+// NaN) give 0. Amounts beyond what a 32-bit price can hold give kMaxQuote,
+// whole dollars, so rounding it to any tick that divides a dollar cannot wrap.
+inline constexpr Price kMaxQuote = 429'496 * kPriceScale;
+[[nodiscard]] inline Price units_to_price(double units) noexcept {
+    if (!(units > 0.0)) {
+        return 0;
+    }
+    return units >= static_cast<double>(kMaxQuote) ? kMaxQuote : static_cast<Price>(units);
+}
 [[nodiscard]] inline Price floor_price(double dollars) noexcept {
-    const double units = std::floor(dollars * static_cast<double>(kPriceScale) + 1e-6);
-    return units <= 0.0 ? Price{0} : static_cast<Price>(units);
+    return units_to_price(std::floor(dollars * static_cast<double>(kPriceScale) + 1e-6));
 }
 [[nodiscard]] inline Price ceil_price(double dollars) noexcept {
-    const double units = std::ceil(dollars * static_cast<double>(kPriceScale) - 1e-6);
-    return units <= 0.0 ? Price{0} : static_cast<Price>(units);
+    return units_to_price(std::ceil(dollars * static_cast<double>(kPriceScale) - 1e-6));
 }
 
 // The highest price on the grid a bid can have without reaching the real best

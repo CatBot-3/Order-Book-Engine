@@ -196,6 +196,25 @@ class TransportTest : public ::testing::Test {
         return all;
     }
 
+    // The same in pieces of 4 KiB, each flushed, so that what is left
+    // waiting for room when the socket fills is less than that, and one go
+    // of the kernel's finishes it once the client reads. Then one turn, which
+    // hands over whatever a completion has prepared.
+    Bytes send_small_pieces_until_blocked(ConnId id, std::uint64_t seed) {
+        Bytes all;
+        const std::uint64_t before = net->stats().blocked_writes;
+        for (std::uint64_t i = 0; i < 100'000 && net->stats().blocked_writes == before; ++i) {
+            const Bytes piece = pattern(seed + i, 4'096);
+            net->send(id, piece);
+            append(all, piece);
+            EXPECT_EQ(net->flush(id), LinkState::Up);
+        }
+        EXPECT_GT(net->stats().blocked_writes, before)
+            << "400 MB went to a client that reads nothing";
+        turn();
+        return all;
+    }
+
     Recorder handler;
     std::unique_ptr<Net> net;
 };
@@ -568,6 +587,107 @@ TEST_F(TransportTest, QueueingBehindASendThatIsUnderWayKeepsEveryByteInPlace) {
     EXPECT_TRUE(client.received() == all) << "the bytes arrived damaged or out of order";
 }
 
+// Reads until nothing more has arrived for 50 ms (at most 10 s), without
+// turning the transport: whatever arrives is the kernel's own doing.
+void drain_without_turning(TcpClient& client) {
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    auto quiet_since = std::chrono::steady_clock::now();
+    std::size_t seen = client.received().size();
+    while (std::chrono::steady_clock::now() < deadline &&
+           std::chrono::steady_clock::now() - quiet_since < 50ms) {
+        client.fill();
+        if (client.received().size() != seen) {
+            seen = client.received().size();
+            quiet_since = std::chrono::steady_clock::now();
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
+// The flush contract again, on the path a completion transport can get
+// wrong: a send that was waiting for room finishes, with more queued behind
+// it. Its completion starts the next send, and that one has to reach the
+// kernel within the same flush, not at the next turn.
+TEST_F(TransportTest, AFlushHandsOverWhatWasQueuedBehindASendThatHasJustFinished) {
+    start();
+    ConnId id = 0;
+    TcpClient client = accepted(id, 4096);
+    Bytes all = send_small_pieces_until_blocked(id, 300);
+
+    const Bytes more = pattern(299, 1'000);
+    net->send(id, more);
+    append(all, more);
+    drain_without_turning(client);
+
+    EXPECT_EQ(net->flush(id), LinkState::Up);
+    EXPECT_EQ(net->unsent(id), 0U)
+        << "the client has read everything, so the socket takes the rest at once";
+    ASSERT_TRUE(turn_until([&] {
+        client.fill();
+        return client.received().size() >= all.size() || client.closed();
+    }));
+    EXPECT_TRUE(client.received() == all) << "the bytes arrived damaged or out of order";
+}
+
+// The same from inside a callback. One turn collects three completions:
+// Ann's bytes, then the end of a send to Cid, then the end of one to Bob.
+// While Ann's are served, the handler sends to Bob and flushes. Bob's send has
+// ended, but its completion has not been looked at yet. A transport that took
+// it for still in flight would report Bob's whole earlier output as unsent,
+// and a gateway judging Bob by that number would drop a client that is
+// keeping up. One that took Cid's completion for Bob's would lose track of
+// both.
+TEST_F(TransportTest, AFlushFromACallbackSeesASendThatEndedInTheSameTurn) {
+    start();
+    ConnId a = 0;
+    ConnId b = 0;
+    ConnId c = 0;
+    TcpClient ann = accepted(a);
+    TcpClient bob = accepted(b, 4096);
+    TcpClient cid = accepted(c, 4096);
+    Bytes to_bob = send_small_pieces_until_blocked(b, 500);
+    Bytes to_cid = send_small_pieces_until_blocked(c, 700);
+
+    const Bytes extra = pattern(499, 500);
+    append(to_bob, extra);
+    bool flushed = false;
+    std::size_t unsent_after = 0;
+    LinkState state = LinkState::Failed;
+    handler.also = [&](ConnId id, std::span<const std::byte> /*bytes*/) {
+        if (id == a && !flushed) {
+            flushed = true;
+            net->send(b, extra);
+            state = net->flush(b);
+            unsent_after = net->unsent(b);
+        }
+    };
+    // Ann's bytes first, then Cid and Bob catch up: in that order their
+    // completions are waiting when the transport next turns.
+    const Bytes hello = pattern(498, 100);
+    ASSERT_EQ(ann.send(hello), hello.size());
+    std::this_thread::sleep_for(10ms);
+    drain_without_turning(cid);
+    drain_without_turning(bob);
+
+    ASSERT_TRUE(turn_until([&] { return flushed; }));
+    EXPECT_EQ(state, LinkState::Up);
+    EXPECT_EQ(unsent_after, 0U) << "Bob's earlier output had been taken, and the new bytes fit";
+    // Both carry on as if nothing had happened: Cid gets more as well.
+    const Bytes more_for_cid = pattern(698, 500);
+    net->send(c, more_for_cid);
+    append(to_cid, more_for_cid);
+    ASSERT_TRUE(turn_until([&] {
+        bob.fill();
+        cid.fill();
+        return (bob.received().size() >= to_bob.size() || bob.closed()) &&
+               (cid.received().size() >= to_cid.size() || cid.closed());
+    }));
+    EXPECT_TRUE(bob.received() == to_bob);
+    EXPECT_TRUE(cid.received() == to_cid);
+    EXPECT_EQ(net->unsent(b), 0U);
+    EXPECT_EQ(net->unsent(c), 0U);
+}
+
 TEST_F(TransportTest, AHandlerMaySendAndFlushFromInsideACallback) {
     start();
     ConnId a = 0;
@@ -924,6 +1044,32 @@ TEST_F(TransportTest, ATransportThatIsDestroyedClosesEverything) {
     EXPECT_TRUE(idle.closed());
     EXPECT_TRUE(slow.closed());
     EXPECT_TRUE(not_yet_accepted.closed());
+}
+
+// For a completion transport: flush(id) collects whatever completions are
+// there, and keeps the ones that are not its business (here, bytes that came
+// in) for the next poll. If the connection is closed and the transport
+// destroyed before that poll, the destructor must still count those as
+// finished. One that waits only for new completions waits for one that will
+// never come, gives up after its time limit, and leaks the connection (which
+// the debug build's leak checker reports).
+TEST_F(TransportTest, ATransportDestroyedBeforeItsNextPollDoesNotWaitForWhatItAlreadyHas) {
+    start();
+    ConnId id = 0;
+    TcpClient client = accepted(id);
+    const Bytes hello = pattern(97, 300);
+    ASSERT_EQ(client.send(hello), hello.size());
+    std::this_thread::sleep_for(20ms);  // the bytes are in, and so is the receive's completion
+    net->send(id, pattern(98, 100));
+    EXPECT_EQ(net->flush(id), LinkState::Up);
+    net->close(id);
+
+    const auto before = std::chrono::steady_clock::now();
+    net.reset();
+    const auto took = std::chrono::steady_clock::now() - before;
+    EXPECT_LT(took, 500ms) << "the destructor waited "
+                           << std::chrono::duration_cast<std::chrono::milliseconds>(took).count()
+                           << " ms for operations that had already finished";
 }
 
 // --- Waiting and counting ------------------------------------------------------------

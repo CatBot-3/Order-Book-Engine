@@ -10,13 +10,10 @@
 // container is judged by exactly the tests the reference has to pass. The same
 // test sources are built twice:
 //
-//   obe_book_tests           the reference containers. Part of the passing
-//                            suite.
+//   obe_book_tests           the reference containers.
 //   obe_hand_written_tests   built with OBE_TEST_HAND_WRITTEN defined: the
 //                            optimized containers of phase 4. Labelled
-//                            needs-your-code; each test fails with the name of
-//                            the missing function until that container is
-//                            written.
+//                            hand-written.
 //
 // To put a new container under test, add it to the lists below (and, to make
 // it selectable with --impl, to obe/book/implementations.hpp).

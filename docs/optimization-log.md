@@ -30,7 +30,7 @@ scripts/run_bench.sh $F baseline --reserve <peak resting orders>
 # 2. Write the hypothesis in this file. Then write the code.
 
 # 3. Correct first: the tests, then the full day against the reference.
-ctest --preset debug -L needs-your-code
+ctest --preset debug -L hand-written
 scripts/diff_books.sh --replay $B/apps/book_replay --file $F --impl flat-store
 
 # 4. After.
@@ -131,10 +131,11 @@ Why
 ## Backlog
 
 Candidates from the project spec, roughly in order of expected payoff. "Ready"
-means the harness can already run the experiment; what is left is the part
-that is yours.
+means the harness can already run the experiment; the third column is the
+code the experiment is about (all of it written now) or what is still to
+decide. `scripts/real_data_evals.sh` runs the ready ones on a real file.
 
-| # | Experiment | What is ready | What is yours | Status |
+| # | Experiment | What is ready | The code, or what is left | Status |
 |---|---|---|---|---|
 | 1 | Order store: `std::unordered_map` to a pre-sized open-addressing flat table | `--impl flat-store`, `--reserve`, contract tests, differential check | `include/obe/book/flat_order_store.hpp` | |
 | 2 | Order store: direct index by reference number | `feed_profile` reports the density and ordering of reference numbers | Decide from the profile whether it is viable. If the span is far larger than the peak of resting orders, log it as rejected with those two numbers and do not build it | |

@@ -24,8 +24,9 @@
 //      written, and when ticks are missing either the way it opened or the
 //      way the scan ended says so.
 //
-// Both codecs are run. Until DeltaCodec is written its functions throw, and
-// the target leaves it out; from then on this fuzzer is its harshest judge.
+// Both codecs are run, and for DeltaCodec this fuzzer is the harshest judge.
+// (A codec whose functions throw util::Unimplemented is left out, which is
+// how the target ran while DeltaCodec was still a stub.)
 //
 //   cmake --preset fuzz && cmake --build --preset fuzz
 //   build/fuzz/fuzz/tick_store_fuzz -max_len=2048 -max_total_time=60 fuzz/tick_seeds

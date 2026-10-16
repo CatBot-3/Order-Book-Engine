@@ -22,10 +22,9 @@
 // Every suite in tests/engine is a typed test over EngineTypes and is built
 // twice, like the book suites:
 //
-//   obe_engine_tests                the reference engine. Part of the passing
-//                                   suite.
+//   obe_engine_tests                the reference engine.
 //   obe_hand_written_engine_tests   built with OBE_TEST_HAND_WRITTEN defined:
-//                                   MatchingEngine. Labelled needs-your-code.
+//                                   MatchingEngine. Labelled hand-written.
 
 namespace obe::engine {
 

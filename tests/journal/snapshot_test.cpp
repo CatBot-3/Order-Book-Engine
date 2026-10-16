@@ -27,7 +27,9 @@
 // a counter, or the order of a queue, and the engine looks right and then
 // answers the next request differently.
 //
-// These run on the reference engine, the one engine that is Restorable today.
+// These run on the reference engine in obe_journal_tests, and again on the
+// pooled MatchingEngine in obe_hand_written_journal_tests, which is built with
+// OBE_TEST_HAND_WRITTEN defined. Both engines are Restorable.
 
 namespace {
 
@@ -38,7 +40,11 @@ using journal::SnapshotOrder;
 using test::Recorded;
 using test::same_state;
 
+#if defined(OBE_TEST_HAND_WRITTEN)
+using Impl = engine::PooledEngineImpl;
+#else
 using Impl = engine::ReferenceEngineImpl;
+#endif
 using Replica = test::Replica<Impl>;
 
 constexpr std::uint32_t kLocates = 64;
@@ -412,6 +418,27 @@ TEST(Restorable, ARestoredReserveIsThereForAFillOrKill) {
     fill_or_kill(500);  // all of it, four fifths of which are hidden
     EXPECT_EQ(r.engine->stats().traded_shares, 500U) << "the hidden shares were not counted";
     EXPECT_EQ(r.engine->open_orders(), 0U);
+}
+
+// restore_order puts an order back "exactly as the RestingOrder describes it",
+// market reference included, whatever else the order has. An engine that keeps
+// the reference only for orders with a display size or a reserve would
+// restore this one under its id, and the market, which knows it by 7, would
+// be told to delete an order it never heard of.
+TEST(Restorable, AMarketReferenceIsRestoredEvenWithoutAReserve) {
+    Replica r;
+    ASSERT_TRUE(r.engine->restore_instrument(1, feed::Symbol::from("AAAA")));
+    ASSERT_TRUE(r.engine->restore_order(
+        1, Side::Buy, {.id = 5, .owner = 1, .token = 0, .price = 10'000, .qty = 100, .ref = 7}));
+    r.engine->restore_counters({.last_order_id = 7, .last_match_number = 0}, {});
+    const auto bids = test::orders_of(*r.engine, 1, Side::Buy);
+    ASSERT_EQ(bids.size(), 1U);
+    EXPECT_EQ(bids[0].ref, 7U);
+    EXPECT_EQ(bids[0].market_ref(), 7U);
+    ASSERT_TRUE(r.engine->cancel(1, 5, 9));
+    const auto deletes = r.messages.of<feed::OrderDelete>();
+    ASSERT_EQ(deletes.size(), 1U);
+    EXPECT_EQ(deletes[0].order_ref, 7U) << "the market knows this order as 7";
 }
 
 // --- restore() ---------------------------------------------------------------------

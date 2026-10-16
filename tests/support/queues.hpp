@@ -8,10 +8,10 @@
 
 // The queues and channels the concurrency tests run against.
 //
-// The same split as the book and the engine. In the passing suite the tests
-// run on MutexQueue. Built with OBE_TEST_HAND_WRITTEN defined, the same tests
-// run on SpscRing, the lock-free ring written by hand in phase 6, and are
-// labelled needs-your-code until it exists.
+// The same split as the book and the engine. In obe_concurrency_tests the
+// tests run on MutexQueue. Built with OBE_TEST_HAND_WRITTEN defined, the same
+// tests run on SpscRing, the lock-free ring written by hand in phase 6, and
+// are labelled hand-written.
 
 namespace obe::test {
 

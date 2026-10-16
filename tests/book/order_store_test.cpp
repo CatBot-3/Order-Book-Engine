@@ -236,6 +236,36 @@ TYPED_TEST(OrderStoreTest, MovingAStoreMovesItsOrders) {
     ASSERT_TRUE(moved.erase(100));
 }
 
+TYPED_TEST(OrderStoreTest, AStoreMovedFromIsEmptyAndStillWorks) {
+    // A standard container leaves a moved-from object "valid but
+    // unspecified". FlatOrderStore promises more (its design point 7): an
+    // empty table that works. One with no slots at all must not compute a
+    // slot from its hash and read it.
+    if constexpr (std::same_as<TypeParam, book::FlatOrderStore>) {
+        for (OrderId id = 1; id <= 100; ++id) {
+            ASSERT_TRUE(this->store.insert(id, kBuy));
+        }
+        TypeParam moved(std::move(this->store));
+        TypeParam& source = this->store;  // NOLINT(bugprone-use-after-move): the point
+        EXPECT_EQ(source.size(), 0U);
+        EXPECT_EQ(source.find(1), nullptr);
+        EXPECT_EQ(std::as_const(source).find(50), nullptr);
+        EXPECT_FALSE(source.erase(1));
+        source.prefetch(7);
+        ASSERT_TRUE(source.insert(7, kBuy));
+        ASSERT_NE(source.find(7), nullptr);
+
+        TypeParam assigned;
+        assigned = std::move(moved);
+        EXPECT_EQ(assigned.size(), 100U);
+        EXPECT_EQ(moved.size(), 0U);  // NOLINT(bugprone-use-after-move): the point
+        EXPECT_EQ(moved.find(1), nullptr);
+        EXPECT_FALSE(moved.erase(1));
+    } else {
+        GTEST_SKIP() << "a standard container makes no promise about a moved-from object";
+    }
+}
+
 // Model-based test: a long seeded sequence of random operations, checked
 // against std::map after every step. Small ids make collisions between
 // operations frequent.

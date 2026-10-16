@@ -22,15 +22,15 @@ did not help.
 | 1 | ITCH 5.0 parser, `itch_stats`, fuzzing | done; not yet run on a real file |
 | 2 | Reference order book | done; not yet run on a real file |
 | 3 | Measurement harness | done; no baseline recorded yet |
-| 4 | Optimization log | harness, tests and tooling ready; the optimized containers are being written; no experiment logged yet |
-| 5 | Matching engine and flow generator | reference engine, flow generator, round trip and tests done; the pooled engine is being written |
-| 6 | Lock-free queue and threaded pipeline | mutex queue, seqlock, three-thread pipeline, benchmarks and tests done; the lock-free ring is being written; nothing measured yet |
+| 4 | Optimization log | harness, tests and tooling ready; the pool, the flat order store and the vector price levels done; no experiment on real data logged yet |
+| 5 | Matching engine and flow generator | done: reference engine, pooled engine (intrusive queues, orders from a pool, chunked id index), flow generator, round trip |
+| 6 | Lock-free queue and threaded pipeline | done: mutex queue, lock-free ring, seqlock, three-thread pipeline, benchmarks; nothing measured yet |
 | 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; nothing measured yet |
-| 8 | Market-making simulator | fill model, metrics, two simple strategies and `mm_sim` done; the Avellaneda-Stoikov strategy is being written; not yet run on a real file |
+| 8 | Market-making simulator | done: fill model, metrics, three strategies including Avellaneda-Stoikov, `mm_sim`; not yet run on a real file |
 | 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; nothing measured yet |
-| 10 | Self-match prevention and more order types (stretch idea 2) | done in the reference engine: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot; the pooled engine has them to write |
-| 11 | Compressed tick store (stretch idea 3) | the file format, queries by time, recovery of an unfinished store, `tick_store` and `tick_bench` done on a codec that does not compress; the compressing codec is being written; nothing recorded from a real file yet |
-| 12 | io_uring gateway against epoll (stretch idea 4) | the gateway runs on any transport; the epoll transport, the io_uring rings (raw system calls), `transport_bench` and `exchange_server --io` done; the io_uring transport itself is being written; nothing measured yet |
+| 10 | Self-match prevention and more order types (stretch idea 2) | done in both engines: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot |
+| 11 | Compressed tick store (stretch idea 3) | done: the file format, queries by time, recovery of an unfinished store, the compressing codec (7.0 bytes a tick on a generated market, against 34 raw), `tick_store`, `tick_bench`; nothing recorded from a real file yet |
+| 12 | io_uring gateway against epoll (stretch idea 4) | done: the gateway runs on either transport; the epoll transport, the io_uring rings (raw system calls) and the io_uring transport, `transport_bench`, `exchange_server --io`; nothing measured yet |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -95,8 +95,8 @@ Google Benchmark are fetched by CMake.
 ```sh
 cmake --preset debug                         # Debug with AddressSanitizer and UBSan
 cmake --build --preset debug
-ctest --preset debug -LE needs-your-code     # everything that is finished
-ctest --preset debug -L needs-your-code      # the hand-written parts still being written
+ctest --preset debug                         # everything
+ctest --preset debug -L hand-written         # only the eight hand-written parts
 ```
 
 Other presets: `release` (the only one whose timings mean anything), `tsan`,
@@ -128,6 +128,24 @@ File used for the numbers below: *to be recorded from the first run* (name,
 uncompressed size, message count).
 
 ## Reproducing the checks
+
+All of it at once, on a real trading day, is one script. It builds the release
+tree in a work directory on the Linux file system, finds or downloads the day,
+runs every check and benchmark below in order, and writes each stage's output
+plus a `SUMMARY.md` into `results/real-<time>/`:
+
+```sh
+scripts/real_data_evals.sh --list            # the stages, in order
+scripts/real_data_evals.sh --quick           # a first pass to see that it all works: 2 runs, no PGO
+scripts/real_data_evals.sh                   # the full set, one to three hours: 5 runs, 1e9-item stress run
+scripts/real_data_evals.sh --only gateway    # one stage again; --skip pgo,tsan leaves some out
+```
+
+`--cpus 2,4,6` picks the CPUs it pins to (the first for single-threaded
+benchmarks, the next two for the producer and consumer), `--work` the build
+and data directory (default `~/obe-evals`, because builds and replays on
+`/mnt/c` or `/mnt/f` under WSL2 go through a slow file share), and `--data`
+a day already on disk. The steps one by one:
 
 ```sh
 cmake --preset release && cmake --build --preset release
@@ -271,14 +289,15 @@ F=data/01302019.NASDAQ_ITCH50
     replays it again and checks the store holds exactly what the book
     publishes; `query` reads only the blocks a range of time can touch.
     `profile` prints what consecutive ticks differ by, which is the table to
-    design the compressing codec from. Until that codec is written, `--codec
-    delta` exits with status 4 and a store is 34 bytes a tick.
+    judge the compressing codec against: `--codec raw`, the default, is 34
+    bytes a tick, and `--codec delta` writes only what changed.
 
     ```sh
     scripts/tick_store_smoke.sh $B/apps/itch_synth $B/apps/tick_store
 
     $B/apps/tick_store profile $F
     $B/apps/tick_store record --codec raw $F data/day.ticks
+    $B/apps/tick_store record --codec delta $F data/day.delta.ticks
     $B/apps/tick_store verify --against $F data/day.ticks
     $B/apps/tick_store info data/day.ticks
     $B/apps/tick_store query --symbol AAPL --from 10:00:00 --to 10:00:01 data/day.ticks
@@ -290,8 +309,8 @@ F=data/01302019.NASDAQ_ITCH50
     either. `transport_bench` shows the mechanism: how many times the server
     crosses into the kernel per request, as the number of busy connections
     grows. The latency curve of step 9, taken once with each transport, shows
-    whether that matters. Until the io_uring transport is written, `--io
-    uring` exits with status 4.
+    whether that matters. Where io_uring is not allowed, `--io uring` exits
+    with status 5.
 
     ```sh
     $B/apps/exchange_server --list-io

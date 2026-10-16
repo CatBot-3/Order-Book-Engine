@@ -17,7 +17,7 @@
 // The judge for a Channel (obe/util/queue_concepts.hpp): a queue a thread can
 // wait on, that can be closed by its producer and cancelled by anybody.
 //
-// In the passing suite it runs on the mutex queue, sleeping and spinning. In
+// In obe_concurrency_tests it runs on the mutex queue, sleeping and spinning. In
 // the hand-written suite it runs on the lock-free ring behind SpinChannel,
 // which is how the pipeline uses the ring.
 

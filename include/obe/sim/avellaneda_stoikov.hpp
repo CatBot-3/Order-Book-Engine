@@ -1,22 +1,18 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 #include "obe/sim/strategy.hpp"
 #include "obe/sim/types.hpp"
 #include "obe/sim/volatility.hpp"
 #include "obe/types.hpp"
-#include "obe/util/todo.hpp"
 
-// The Avellaneda-Stoikov market-making strategy.
+// The Avellaneda-Stoikov market-making strategy: Avellaneda and Stoikov,
+// "High-frequency trading in a limit order book" (2008), sections 2 and 3.
 //
-// THIS ONE IS YOURS TO WRITE. The simulator, the fill model, the volatility
-// estimate and the simple strategies in strategy.hpp are done; quote() below
-// throws until you fill it in. It is about twenty lines. The paper is
-// Avellaneda and Stoikov, "High-frequency trading in a limit order book"
-// (2008); read sections 2 and 3 before writing anything.
-//
-//   ctest --preset debug -L needs-your-code -R AvellanedaStoikov
+//   ctest --preset debug -R AvellanedaStoikov
 //   build/release/apps/mm_sim <file> --symbol <S> --strategy as
 //
 // THE CONTRACT (the tests check exactly this)
@@ -43,53 +39,90 @@
 //      came out as 0. No ask when view.inventory <= -params.max_inventory.
 //  10. Each quote is for params.qty shares.
 //
-// QUESTIONS TO BE ABLE TO ANSWER BEFORE YOU CALL IT DONE
+// WHAT THE FORMULA MEANS, AND WHERE THIS SIMULATOR BENDS IT
 //
-//  1. Where the reservation price comes from.
-//     It is the price at which you would be indifferent between holding your
-//     inventory and holding one unit more or less. Why does it sit below the
-//     mid when you are long? Why is the distance proportional to sigma^2 and
-//     to tau, and not to sigma?
+//  1. The reservation price.
+//     The model's trader maximises expected exponential utility, -exp(-gamma
+//     * wealth), which values an uncertain position at its expected value
+//     minus gamma / 2 times its variance. Holding q units of a mid that moves
+//     like a random walk with variance sigma^2 per second, the position's
+//     variance at the horizon is q^2 * sigma^2 * tau. The price at which one
+//     more unit (or one fewer) leaves that value unchanged is r = s - q *
+//     gamma * sigma^2 * tau. Long (q > 0), each extra unit adds risk, so it
+//     is worth less than the mid to this trader: r sits below s, both quotes
+//     move down, the ask gets hit more and the bid less, and the inventory
+//     drifts back toward zero. The distance is proportional to sigma^2 * tau,
+//     not sigma, because a random walk's VARIANCE grows linearly with time,
+//     and exponential utility charges for variance.
 //
 //  2. The two terms of the spread.
-//     One is about the risk of holding inventory and one is about how often
-//     quotes get hit. Which is which? Which of them survives when gamma goes
-//     to zero, and what is its limit? (Expand ln(1 + x) for small x.)
+//     gamma * sigma^2 * tau is the inventory-risk term: what holding a
+//     position for the rest of the session is expected to cost in utility.
+//     (2 / gamma) * ln(1 + gamma / k) comes from the fills: the model says a
+//     quote delta from the mid is hit at a rate A * exp(-k * delta), and this
+//     is the spread that best trades a wider margin against fewer fills. As
+//     gamma goes to 0 the risk term vanishes and ln(1 + x) = x - x^2 / 2 + ...
+//     gives 2 / k: a risk-neutral trader quotes 1 / k either side, the
+//     distance that maximises delta * exp(-k * delta).
 //
-//  3. What happens as tau goes to zero.
-//     The inventory term disappears: near the end of the session the model
-//     stops caring about its position. Is that what you would want at 15:59
-//     with a large position? What would an infinite-horizon version change,
-//     and how does max_tau let you approximate one?
+//  3. As tau goes to zero the inventory term goes with it.
+//     The model values what is left at the end at the final mid, with no cost
+//     to get rid of it, so at 15:59 it stops leaning against a large position
+//     just when a real trader would lean hardest (the position must be closed
+//     or carried overnight). An infinite-horizon version keeps the lean
+//     constant through the day. max_tau approximates that: tau is capped, so
+//     the quotes are the same at 10:00 and at 15:00, and the lean only fades
+//     in the last max_tau seconds.
 //
 //  4. Units.
-//     Check that q * gamma * sigma^2 * tau comes out in dollars per share.
-//     Why is q counted in quotes and not in shares? What would happen to the
-//     meaning of gamma if you doubled the quote size otherwise?
+//     q is a pure number; gamma is per dollar; sigma^2 is dollars squared per
+//     second; tau is seconds. q * gamma * sigma^2 * tau is (1/$) * ($^2/s)
+//     * s = dollars, added to a per-share price s: dollars per share. q is
+//     counted in quotes because in the model one fill moves q by exactly one
+//     unit. Counted in shares, one fill would move q by the quote size, so
+//     doubling the size would double the lean each fill causes and a gamma
+//     tuned at one size would mean twice as much at the other. The price of
+//     the convention: ten fills of 200 shares lean as much as ten fills of
+//     100, though they are twice the risk.
 //
-//  5. What k is, and why 1.5 is not it.
-//     The paper models the chance of a quote at distance d from the mid being
-//     hit as proportional to exp(-k * d), and uses k = 1.5 with a spread of
-//     about a dollar and a half. For a stock that trades a cent wide, what
-//     order of magnitude must k have for the spread term to be about a cent?
-//     How would you estimate k from this simulator's own output?
+//  5. k is per dollar, and depends on the stock.
+//     The paper's k = 1.5 goes with a spread of about two thirds of a
+//     dollar either side: a toy stock. For the spread term (about 2 / k) to be
+//     one cent, k must be about 200 per dollar, the default here. To estimate
+//     it from this simulator: run FixedSpread at several distances d, count
+//     fills per second at each, and fit ln(rate) = ln(A) - k * d; the slope
+//     is -k.
 //
-//  6. What the model assumes, and what this simulator does to it.
-//     The model's mid is a random walk with no drift and no jumps, and its
-//     fills arrive at random, independent of where the mid goes next. Look at
-//     the three ways a quote is filled in simulator.hpp. Are those fills
-//     independent of the next move of the mid? What does that predict for the
-//     markout figures, and for the profit the model promises?
+//  6. The model's fills are independent of the next move. These are not.
+//     The model has fills arrive at random, unrelated to where the mid goes
+//     next. The simulator fills a quote in three ways (sim/types.hpp,
+//     FillReason): the orders ahead of it were executed, a worse price than
+//     it traded, or an arriving order reached it. All three happen when the
+//     market is moving into the quote: the bid gets filled as the price
+//     falls through it. So fills are adversely selected, the markouts after a
+//     fill should be negative on average, and the profit the model promises
+//     (half the spread on every fill) is an upper bound the simulator should
+//     not reach. That gap is the most interesting number mm_sim prints.
 //
-//  7. Rounding.
-//     Why does the bid round down and the ask up? What does the strategy do
-//     when the model's spread is narrower than one tick, and is the clamp in
-//     step 8 then doing the model's job or overriding it?
+//  7. Rounding outward.
+//     The bid rounds down and the ask up, so rounding never quotes tighter
+//     than the model asked: a quote rounded toward the mid would be one the
+//     model considers too close to be worth having. When the model's spread
+//     is narrower than a tick, the rounded quotes can reach or cross the
+//     other side of the market; step 8 then puts them one tick inside it.
+//     That clamp overrides the model, which assumes a continuous price and a
+//     quote that never takes liquidity: prices are discrete and this
+//     strategy only provides liquidity.
 //
-//  8. The inventory limit.
-//     The model already leans against inventory through r. Why have a hard
-//     limit as well? Find parameters for which the limit is never reached and
-//     parameters for which it always is, and say what each tells you.
+//  8. The hard inventory limit.
+//     The lean through r is soft: it is gamma * sigma^2 * tau per unit, which
+//     is small in a quiet market or with a small gamma, and the adverse
+//     selection of point 6 pushes inventory in the direction of the trend.
+//     The limit bounds the worst case whatever the parameters. With a large
+//     gamma the lean keeps inventory near zero and the limit is never
+//     reached: the model is doing the risk management. With gamma near zero
+//     there is no lean, inventory wanders with the trend and the limit is
+//     reached all day: then the limit, not the model, is the strategy.
 
 namespace obe::sim {
 
@@ -117,9 +150,40 @@ class AvellanedaStoikov {
     explicit AvellanedaStoikov(const AsParams& params = {})
         : params_(params), variance_(params.vol_half_life) {}
 
-    // See the contract above.
+    // See the contract above; the step numbers refer to it.
     Quotes quote(const MarketView& view) {
-        util::todo("AvellanedaStoikov::quote", view, variance_);
+        Quotes out;
+        if (!view.two_sided()) {  // 1
+            return out;
+        }
+        const double s = mid_dollars(view.mid2());  // 2
+        variance_.observe(view.now, s);
+        const double sigma2 = params_.sigma2 > 0.0 ? params_.sigma2 : variance_.value();  // 3
+        double tau = 0.0;                                                                 // 4
+        if (view.end > view.now) {
+            tau = std::min(
+                static_cast<double>(view.end - view.now) / static_cast<double>(kNanosPerSecond),
+                params_.max_tau);
+        }
+        const double q =
+            static_cast<double>(view.inventory) / static_cast<double>(params_.qty);  // 5
+
+        const double risk = params_.gamma * sigma2 * tau;  // 6
+        const double r = s - q * risk;
+        const double spread = risk + (2.0 / params_.gamma) * std::log1p(params_.gamma / params_.k);
+
+        Price bid = floor_to_tick(floor_price(r - spread / 2.0), view.tick);  // 7
+        Price ask = ceil_to_tick(ceil_price(r + spread / 2.0), view.tick);
+        bid = std::min(bid, passive_bid_limit(view));  // 8
+        ask = std::max(ask, passive_ask_limit(view));
+
+        if (view.inventory < params_.max_inventory && bid > 0) {  // 9, 10
+            out.bid = {bid, params_.qty};
+        }
+        if (view.inventory > -params_.max_inventory) {
+            out.ask = {ask, params_.qty};
+        }
+        return out;
     }
 
     [[nodiscard]] const AsParams& params() const noexcept { return params_; }

@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 #include "obe/book/types.hpp"
 #include "obe/sim/strategy.hpp"
@@ -54,6 +55,22 @@ TEST(TickGrid, DollarsToPricesRoundTheWayTheyAreAsked) {
     EXPECT_EQ(sim::floor_price(0.0), 0U);
     EXPECT_DOUBLE_EQ(sim::mid_dollars(200'400), 10.02);
     EXPECT_DOUBLE_EQ(sim::mid_dollars(200'300), 10.015);
+}
+
+TEST(TickGrid, AmountsAPriceCannotHoldStopAtTheLargestQuote) {
+    // A formula with extreme parameters can ask for more than a 32-bit price
+    // holds ($429,496.7295), or produce NaN. Converting such a double to the
+    // integer type would be undefined; the result is capped instead, at whole
+    // dollars, so that rounding it up to a tick cannot wrap around to a price
+    // near zero.
+    EXPECT_EQ(sim::ceil_price(1e12), sim::kMaxQuote);
+    EXPECT_EQ(sim::floor_price(1e12), sim::kMaxQuote);
+    EXPECT_EQ(sim::ceil_price(std::numeric_limits<double>::infinity()), sim::kMaxQuote);
+    EXPECT_EQ(sim::ceil_price(std::numeric_limits<double>::quiet_NaN()), 0U);
+    EXPECT_EQ(sim::floor_price(-std::numeric_limits<double>::infinity()), 0U);
+    EXPECT_EQ(sim::ceil_to_tick(sim::kMaxQuote, 100), sim::kMaxQuote);
+    EXPECT_EQ(sim::floor_price(429'496.0), sim::kMaxQuote);
+    EXPECT_EQ(sim::floor_price(429'495.5), 4'294'955'000U);  // below the cap: unchanged
 }
 
 TEST(TickGrid, AResultThatShouldBeExactDoesNotLoseAUnitToFloatingPoint) {

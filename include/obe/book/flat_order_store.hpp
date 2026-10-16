@@ -1,24 +1,23 @@
 #pragma once
 
+#include <bit>
 #include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
 
 #include "obe/book/concepts.hpp"
 #include "obe/book/types.hpp"
 #include "obe/types.hpp"
-#include "obe/util/todo.hpp"
 
-// ============================================================================
-//  YOURS TO WRITE: phase 4, experiment 1
-// ============================================================================
-//
-// FlatOrderStore is the optimized order store: an open-addressing hash table
-// that keeps every order in one contiguous, pre-sized array instead of one heap
-// node per order.
+// FlatOrderStore: the optimized order store. An open-addressing hash table
+// that keeps every order in one contiguous array of slots, instead of one heap
+// node per order. Phase 4, experiment 1.
 //
 // The hypothesis (spec, phase 4): std::unordered_map allocates a node per order
 // and chases two pointers per lookup; a flat table removes the allocation and
-// turns most lookups into one cache line. Write the hypothesis and your
-// expected numbers in docs/optimization-log.md BEFORE measuring.
+// turns most lookups into one cache line. docs/optimization-log.md has the
+// entry with the measured result.
 //
 // The contract is OrderStoreLike (obe/book/concepts.hpp), the same one the
 // reference satisfies, so BookManager and every test work unchanged. The judges:
@@ -29,97 +28,235 @@
 //   replay_bench --impl flat-store      refuses to report timings as valid
 //                                       unless the hash matches the reference
 //
-// Every function below throws until you replace its body.
+// DESIGN
 //
-// Decisions to make. Measure where you can; `build/release/apps/feed_profile
-// <file>` reports the facts about the real feed that several of them turn on.
+//  1. Collisions: linear probing.
+//     An order whose home slot is taken goes in the next free slot. A probe
+//     then walks consecutive memory, usually inside one or two cache lines,
+//     and the hardware prefetcher follows it. Quadratic probing and double
+//     hashing break up clusters but jump around memory to do it; Robin Hood
+//     bounds the worst probe by moving entries on every insert. This table's
+//     traffic is nearly all find() calls that hit, and a short probe from a
+//     good hash at a moderate load (point 5) is already one or two slots:
+//     the simplest scheme with the best locality wins.
 //
-//  1. Collisions: where does an order go when its slot is taken?
-//     Linear probing keeps a probe sequence inside a cache line or two.
-//     Quadratic probing and double hashing spread clusters out and give up
-//     that locality. Robin Hood hashing bounds the worst probe length by
-//     moving entries on insert. Which costs the workload cares about: this is
-//     a table where almost every operation is a find() that hits.
+//  2. Deletion: backward shift, no tombstones.
+//     An emptied slot cannot simply be marked free: a find() for a key that
+//     was placed further along, because this slot was taken when it was
+//     inserted, would stop here and miss it. Tombstones ("deleted, keep
+//     going") fix that, but an ITCH day adds and removes hundreds of millions
+//     of orders at a roughly constant size. Tombstones accumulate, every probe
+//     walks over them, and without a periodic rebuild the table ends up full
+//     of them. Instead erase() pulls later entries of the same cluster back
+//     into the hole: walking on from the hole, each entry whose home slot is
+//     not between the hole and itself (cyclically) moves into the hole, and
+//     its old slot becomes the new hole, until an empty slot is reached. The
+//     table is then exactly as if the erased key had never been inserted, so
+//     probe lengths do not decay with churn.
 //
-//  2. Deletion. This is the part most first attempts get wrong.
-//     In ITCH nearly every order that is added is later removed, so the table
-//     sees as many erases as inserts all day while its size stays roughly
-//     level. With open addressing you cannot simply mark a slot empty: think
-//     about a find() for a key whose probe sequence passed through that slot.
-//     The two standard answers are tombstones and backward-shift deletion.
-//     What happens to probe lengths after a few hundred million insert/erase
-//     pairs with tombstones and no cleanup? (The churn test in
-//     order_store_test.cpp exists to make that failure visible.)
+//  3. Empty or used: one byte, in padding that is there anyway.
+//     A reserved key would be cheapest, but reference numbers 0 and 2^64 - 1
+//     are both legal (and tested). A slot is {8-byte key, 12-byte record}: 20
+//     bytes, which the compiler pads to 24 for the key's alignment. A flag
+//     byte fits in those 4 spare bytes, so marking occupancy costs nothing in
+//     size, and it sits in the same line as the key it describes.
 //
-//  3. How do you tell an empty slot from a used one?
-//     A reserved key value is the cheapest, but the tests insert reference
-//     numbers 0 and 2^64 - 1, and nothing in the specification rules either
-//     out. A separate byte of metadata per slot costs memory and a second
-//     array to touch. Is there spare room in the slot you already have?
-//     (sizeof(OrderRecord) is 12; what does the compiler pad a slot to?)
+//  4. The hash: Fibonacci hashing, the top bits of key * 2^64/phi.
+//     The identity function with a mask would put consecutive reference
+//     numbers in consecutive slots, which looks ideal for sequential ITCH
+//     numbers but makes long runs of occupied slots out of them, and it
+//     collapses keys that differ only in their high bits into one slot (the
+//     test KeysThatDifferOnlyInTheirHighBitsStayDistinct). One multiply by
+//     the 64-bit golden-ratio constant, keeping the top log2(capacity) bits,
+//     spreads any pattern of keys evenly, because every input bit reaches the
+//     top bits of the product. It costs one multiply and a shift.
 //
-//  4. The hash function.
-//     feed_profile shows how reference numbers are distributed. If they are
-//     close to sequential, the identity function with a power-of-two mask puts
-//     consecutive orders in consecutive slots, which is either ideal or
-//     terrible depending on your probing. What happens to it when keys differ
-//     only in their high bits? (order_store_test.cpp has a test that does
-//     exactly that.) A multiplicative hash is one multiply; is it worth it
-//     here? Measure both and log the loser too.
+//  5. Capacity and growth: a power of two, at most 70% full.
+//     A power-of-two capacity makes the slot index a shift (and a mask for
+//     the probe). Linear probing's expected probe length grows like
+//     1/(1 - load)^2 for a miss; at 70% that is about 6 slots for a miss and
+//     2 for a hit, with misses rare here. Past the limit the table doubles and
+//     every entry is re-inserted, which is why a pointer from find() dies at
+//     the next insert or erase. Pre-sized from feed_profile's peak of resting
+//     orders (replay_bench --reserve), a real day never grows.
 //
-//  5. Capacity and growth.
-//     Power-of-two capacity makes "mod" a mask. What maximum load factor, and
-//     what does probe length do as you approach it? feed_profile reports the
-//     peak number of resting orders; pre-size from that so a real day never
-//     grows. Growth must still work (the tests construct a small table and
-//     overfill it), and it may move every element: that is why the contract
-//     says a pointer from find() dies at the next insert or erase.
+//  6. Layout: an array of {key, record, flag} slots (experiment 5).
+//     A probe compares keys, and a hit then reads the record next to the key
+//     it matched: one line for both. Keys in a separate array would put eight
+//     keys in a line instead of two and a half, and make every hit touch a
+//     second array. With probes of one or two slots, the record next door
+//     wins; a separate-arrays layout would pay off for long probes, which
+//     point 5 avoids.
 //
-//  6. Layout (this is also experiment 5).
-//     Array of {key, record} slots, or keys in one array and records in
-//     another? During a probe you compare keys and nothing else. How many
-//     keys fit in a cache line each way?
+//  7. Movable: BookManager takes its store by value. The move operations leave
+//     the source an empty table that still works.
 //
-//  7. The class must stay movable: BookManager takes its store by value.
-//
-// Optional hooks for later experiments. Add them when you get there; the
-// harness detects them at compile time and nothing breaks without them.
-//
-//   void prefetch(OrderId id) const noexcept;
-//       Experiment 6. replay_bench --prefetch calls this for the order the
-//       NEXT message refers to, before handling the current one. Issue a
-//       software prefetch for the slot that id hashes to and return.
-//
-//   Experiment 8 (huge pages): obe/util/huge_pages.hpp has HugePageBuffer, a
-//   block of memory that asks the kernel for transparent huge pages. Back the
-//   slot array with it and compare.
+//  8. prefetch(id) (experiment 6): replay_bench --prefetch calls it for the
+//     order the next message refers to, before handling the current one. It
+//     issues a software prefetch of that key's home slot.
 
 namespace obe::book {
 
 class FlatOrderStore {
  public:
-    FlatOrderStore() = default;
+    FlatOrderStore() : FlatOrderStore(std::size_t{0}) {}
 
     // Pre-size for `expected_orders` live orders.
-    explicit FlatOrderStore(std::size_t expected_orders) { static_cast<void>(expected_orders); }
+    explicit FlatOrderStore(std::size_t expected_orders) {
+        std::size_t capacity = kMinCapacity;
+        while (capacity * kLoadNumerator / kLoadDenominator < expected_orders) {
+            capacity *= 2;
+        }
+        reset(capacity);
+    }
+
+    FlatOrderStore(const FlatOrderStore&) = default;
+    FlatOrderStore& operator=(const FlatOrderStore&) = default;
+
+    FlatOrderStore(FlatOrderStore&& other) noexcept
+        : slots_(std::move(other.slots_)),
+          mask_(std::exchange(other.mask_, 0)),
+          shift_(std::exchange(other.shift_, 0)),
+          size_(std::exchange(other.size_, 0)) {
+        other.slots_.clear();
+    }
+
+    FlatOrderStore& operator=(FlatOrderStore&& other) noexcept {
+        if (this != &other) {
+            slots_ = std::move(other.slots_);
+            other.slots_.clear();
+            mask_ = std::exchange(other.mask_, 0);
+            shift_ = std::exchange(other.shift_, 0);
+            size_ = std::exchange(other.size_, 0);
+        }
+        return *this;
+    }
+
+    ~FlatOrderStore() = default;
 
     // Adds the order. Returns false, changing nothing, if `id` is present.
     bool insert(OrderId id, const OrderRecord& rec) {
-        util::todo("FlatOrderStore::insert", id, rec);
+        if ((size_ + 1) * kLoadDenominator > slots_.size() * kLoadNumerator) [[unlikely]] {
+            grow();
+        }
+        std::size_t i = home(id);
+        while (slots_[i].used) {
+            if (slots_[i].key == id) {
+                return false;
+            }
+            i = (i + 1) & mask_;
+        }
+        slots_[i] = Slot{id, rec, true};
+        ++size_;
+        return true;
     }
 
     // The stored record, or nullptr. Valid until the next insert or erase.
-    OrderRecord* find(OrderId id) { util::todo("FlatOrderStore::find", id); }
-    const OrderRecord* find(OrderId id) const { util::todo("FlatOrderStore::find const", id); }
+    OrderRecord* find(OrderId id) noexcept {
+        const std::size_t i = locate(id);
+        return i == kNone ? nullptr : &slots_[i].rec;
+    }
+    const OrderRecord* find(OrderId id) const noexcept {
+        const std::size_t i = locate(id);
+        return i == kNone ? nullptr : &slots_[i].rec;
+    }
 
     // Removes the order. Returns false if it was not present.
-    bool erase(OrderId id) { util::todo("FlatOrderStore::erase", id); }
+    bool erase(OrderId id) noexcept {
+        std::size_t hole = locate(id);
+        if (hole == kNone) {
+            return false;
+        }
+        // Backward shift (design point 2): walk the rest of the cluster and
+        // pull back every entry the hole would otherwise cut off from its
+        // home slot.
+        for (std::size_t j = (hole + 1) & mask_; slots_[j].used; j = (j + 1) & mask_) {
+            const std::size_t k = home(slots_[j].key);
+            // Entry j may stay where it is if its home k lies cyclically in
+            // (hole, j]: a probe from k reaches j without passing the hole.
+            const bool stays = hole <= j ? (hole < k && k <= j) : (hole < k || k <= j);
+            if (!stays) {
+                slots_[hole] = slots_[j];
+                hole = j;
+            }
+        }
+        slots_[hole].used = false;
+        --size_;
+        return true;
+    }
 
     // Number of orders currently stored.
-    std::size_t size() const { util::todo("FlatOrderStore::size"); }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+    // Slots in the table, used or not. For tests and reports.
+    [[nodiscard]] std::size_t capacity() const noexcept { return slots_.size(); }
+
+    // Experiment 6: start loading the slot `id` hashes to.
+    void prefetch(OrderId id) const noexcept {
+        if (!slots_.empty()) {
+            __builtin_prefetch(slots_.data() + home(id));
+        }
+    }
 
  private:
-    // Your storage goes here.
+    struct Slot {
+        OrderId key = 0;
+        OrderRecord rec{};
+        bool used = false;  // lives in the slot's padding (design point 3)
+    };
+    static_assert(sizeof(Slot) == 24, "the flag was meant to fit in the padding");
+
+    static constexpr std::size_t kMinCapacity = 16;
+    static constexpr std::size_t kLoadNumerator = 7;  // at most 7/10 full
+    static constexpr std::size_t kLoadDenominator = 10;
+    static constexpr std::size_t kNone = ~std::size_t{0};
+    static constexpr std::uint64_t kGolden = 0x9E3779B97F4A7C15ULL;  // 2^64 / phi
+
+    [[nodiscard]] std::size_t home(OrderId id) const noexcept {
+        return static_cast<std::size_t>((id * kGolden) >> shift_);
+    }
+
+    // The slot holding `id`, or kNone.
+    [[nodiscard]] std::size_t locate(OrderId id) const noexcept {
+        if (size_ == 0) {
+            return kNone;  // also covers a moved-from table, which has no slots
+        }
+        std::size_t i = home(id);
+        while (slots_[i].used) {
+            if (slots_[i].key == id) {
+                return i;
+            }
+            i = (i + 1) & mask_;
+        }
+        return kNone;
+    }
+
+    void reset(std::size_t capacity) {
+        slots_.assign(capacity, Slot{});
+        mask_ = capacity - 1;
+        shift_ = 64U - static_cast<unsigned>(std::countr_zero(capacity));
+        size_ = 0;
+    }
+
+    void grow() {
+        std::vector<Slot> old = std::move(slots_);
+        reset(old.empty() ? kMinCapacity : old.size() * 2);
+        for (const Slot& s : old) {
+            if (s.used) {
+                std::size_t i = home(s.key);
+                while (slots_[i].used) {
+                    i = (i + 1) & mask_;
+                }
+                slots_[i] = s;
+                ++size_;
+            }
+        }
+    }
+
+    std::vector<Slot> slots_;
+    std::size_t mask_ = 0;
+    unsigned shift_ = 0;
+    std::size_t size_ = 0;
 };
 
 static_assert(OrderStoreLike<FlatOrderStore>);

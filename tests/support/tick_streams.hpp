@@ -30,10 +30,9 @@
 //
 // Every suite in tests/store is typed over CodecTypes and built twice:
 //
-//   obe_store_tests                the reference codec (RawCodec). Part of
-//                                  the passing suite.
+//   obe_store_tests                the reference codec (RawCodec).
 //   obe_hand_written_store_tests   built with OBE_TEST_HAND_WRITTEN defined:
-//                                  DeltaCodec. Labelled needs-your-code.
+//                                  DeltaCodec. Labelled hand-written.
 
 namespace obe::test {
 

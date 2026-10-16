@@ -6,8 +6,9 @@
 #   scripts/pgo_build.sh data/01302019.NASDAQ_ITCH50
 #   scripts/pgo_build.sh data/01302019.NASDAQ_ITCH50 --impl flat-store --reserve 3000000
 #   CXX=clang++ scripts/pgo_build.sh data/01302019.NASDAQ_ITCH50
+#   BUILD=/tmp/pgo scripts/pgo_build.sh data/01302019.NASDAQ_ITCH50
 #
-# Three steps, all in build/release-pgo:
+# Three steps, all in build/release-pgo (or in $BUILD, if set):
 #   1. build an instrumented replay_bench;
 #   2. run it on the training file, which writes the profile;
 #   3. rebuild with the profile.
@@ -27,16 +28,20 @@ TRAIN="$1"
 shift
 
 cd "$(dirname "$0")/.."
-BUILD="build/release-pgo"
-PROFILES="$PWD/$BUILD/pgo-profiles"
+BUILD="${BUILD:-build/release-pgo}"
+case "$BUILD" in
+    /*) ;;
+    *) BUILD="$PWD/$BUILD" ;;
+esac
+PROFILES="$BUILD/pgo-profiles"
 
 echo "==> 1/3 instrumented build"
 # Start from nothing. A build directory remembers its compiler, and profiles
 # left over from an earlier run would be mixed into this one.
 rm -rf "$BUILD"
 mkdir -p "$PROFILES"
-cmake --preset release-pgo -DOBE_PGO=generate -DOBE_PGO_DIR="$PROFILES" >/dev/null
-cmake --build --preset release-pgo --target replay_bench
+cmake --preset release-pgo -B "$BUILD" -DOBE_PGO=generate -DOBE_PGO_DIR="$PROFILES" >/dev/null
+cmake --build "$BUILD" --target replay_bench
 
 echo "==> 2/3 training run on $TRAIN"
 "$BUILD/bench/replay_bench" "$TRAIN" --runs 1 --warmup 0 --no-verify "$@" >/dev/null
@@ -59,7 +64,7 @@ if [[ -z "$(find "$PROFILES" -type f | head -n1)" ]]; then
 fi
 
 echo "==> 3/3 optimized build"
-cmake --preset release-pgo -DOBE_PGO=use -DOBE_PGO_DIR="$PROFILES" >/dev/null
-cmake --build --preset release-pgo --target replay_bench
+cmake --preset release-pgo -B "$BUILD" -DOBE_PGO=use -DOBE_PGO_DIR="$PROFILES" >/dev/null
+cmake --build "$BUILD" --target replay_bench
 
 echo "done: $BUILD/bench/replay_bench"

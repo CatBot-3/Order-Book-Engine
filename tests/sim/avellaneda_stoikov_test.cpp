@@ -13,8 +13,7 @@
 
 // The Avellaneda-Stoikov strategy: the part of the simulator written by hand.
 //
-// Every test here fails until AvellanedaStoikov::quote is written. The
-// expected prices were worked out from the contract in
+// The expected prices were worked out from the contract in
 // obe/sim/avellaneda_stoikov.hpp with a calculator, not with the code under
 // test, and each test shows its working so that a failure can be checked by
 // hand.

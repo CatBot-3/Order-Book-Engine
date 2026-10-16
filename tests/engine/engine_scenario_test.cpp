@@ -19,7 +19,7 @@
 // all three things an operation produces: the reports to the owners, the
 // market data, and the book that is left.
 //
-// In the passing suite they run against the reference engine and against the
+// In obe_engine_tests they run against the reference engine and against the
 // test oracle (support/naive_engine.hpp). The property tests use the oracle to
 // judge the reference on random flow, which is only worth something if the
 // oracle itself agrees with these hand-worked cases.

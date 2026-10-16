@@ -37,8 +37,8 @@
 //
 // These run on the reference engine, because the gateway's behaviour does not
 // depend on the engine, and on whichever transport the build selects
-// (support/tcp_client.hpp): epoll in the passing suite, the hand-written
-// io_uring transport in the needs-your-code one. Nothing below knows which.
+// (support/tcp_client.hpp): epoll in obe_net_tests, the hand-written io_uring
+// transport in obe_hand_written_net_tests. Nothing below knows which.
 
 namespace {
 

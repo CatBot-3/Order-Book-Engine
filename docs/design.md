@@ -294,66 +294,51 @@ the check that matters for the queues and the seqlock (section 9.6).
 
 ## 6. Written by hand
 
-The project spec keeps the core data structures hand-written. Their headers
-ship with the interface, the contract, design questions and a test suite; the
-bodies are left out until they are written.
+The project spec keeps the core data structures hand-written: no library
+container stands in for them. Each has a simple reference version beside it,
+written first, and is judged by the same tests the reference passes plus a
+differential check against it.
 
 | Component | File | Status |
 |---|---|---|
 | Reference order store | `include/obe/book/order_store.hpp` | written |
 | Reference price levels | `include/obe/book/price_levels.hpp` | written |
-| Flat order table (experiment 1) | `include/obe/book/flat_order_store.hpp` | **to write** |
-| Contiguous price levels (experiment 3) | `include/obe/book/vector_price_levels.hpp` | **to write** |
-| Pool (experiment 4, and the engine later) | `include/obe/util/pool.hpp` | **to write** |
+| Flat order table (experiment 1) | `include/obe/book/flat_order_store.hpp` | written by hand |
+| Contiguous price levels (experiment 3) | `include/obe/book/vector_price_levels.hpp` | written by hand |
+| Pool (experiment 4, and the engine's orders) | `include/obe/util/pool.hpp` | written by hand |
 | Reference matching engine | `include/obe/engine/reference_engine.hpp` | written |
-| Matching engine (pooled, intrusive queues), including the instructions of section 8.6 | `include/obe/engine/matching_engine.hpp` | **to write** |
+| Matching engine (pooled, intrusive queues), including the instructions of section 8.6 and snapshots | `include/obe/engine/matching_engine.hpp` | written by hand |
 | Mutex queue, spin channel, seqlock, pipeline | `include/obe/util/mutex_queue.hpp`, `spin_channel.hpp`, `seqlock.hpp`, `include/obe/pipeline/` | written |
-| Lock-free ring | `include/obe/util/spsc_ring.hpp` | **to write** |
+| Lock-free ring | `include/obe/util/spsc_ring.hpp` | written by hand |
 | Gateway, market-data publisher and receiver, load generator | `include/obe/net/`, `apps/` | written |
 | Market-making simulator, fill model, simple strategies, volatility estimate | `include/obe/sim/` | written |
-| Avellaneda-Stoikov strategy | `include/obe/sim/avellaneda_stoikov.hpp` | **to write** |
+| Avellaneda-Stoikov strategy | `include/obe/sim/avellaneda_stoikov.hpp` | written by hand |
 | Journal, replay, snapshot, recovery from files | `include/obe/journal/` | written |
-| Snapshot support for the hand-written engine | the five `Restorable` functions, in `include/obe/engine/matching_engine.hpp` | optional: see below |
 | Tick store: varints, the file, the reference codec, the profile | `include/obe/util/varint.hpp`, `include/obe/store/` | written |
-| Compressing tick codec | `include/obe/store/delta_codec.hpp` | **to write** |
+| Compressing tick codec | `include/obe/store/delta_codec.hpp` | written by hand |
 | Gateway session logic, the transport contract, the epoll transport and its output buffer, the io_uring rings | `include/obe/net/order_gateway.hpp`, `transport.hpp`, `epoll_transport.hpp`, `out_buffer.hpp`, `uring.hpp` | written |
-| io_uring transport | `include/obe/net/uring_transport.hpp` | **to write** |
+| io_uring transport | `include/obe/net/uring_transport.hpp` | written by hand |
 
-Each "to write" header holds the interface, the questions to settle and where
-the measurements that settle them come from. Their tests are built into
-second executables (`obe_hand_written_tests` for the containers,
-`obe_hand_written_engine_tests` for the engine,
-`obe_hand_written_concurrency_tests` for the ring) from the same sources as the
-reference tests, and carry the `ctest` label `needs-your-code` and, in
-`ctest`'s own listing, the prefix `hand_written.` on their names. The prefix
-is not decoration. A test that does not depend on the hand-written part has
-the same name in both executables, `ctest` keeps labels by name, and of two
-tests with one name the first ended up carrying the label of the second: a
-handful of finished tests were being left out of the "everything that is
-finished" run below until the names were made distinct. The strategy
-has an executable of its own, `obe_hand_written_sim_tests`, under the same
-label, the tick codec has `obe_hand_written_store_tests`, and the io_uring
-transport has `obe_hand_written_net_tests`:
+Each hand-written header holds its contract and, under DESIGN, the decision
+taken on every question the part raises and the reason for it. Sections 6.3 to
+6.10 summarise them. Their tests are built into second executables
+(`obe_hand_written_tests` for the containers and the pool,
+`obe_hand_written_engine_tests` and `obe_hand_written_journal_tests` for the
+engine, `obe_hand_written_concurrency_tests` for the ring,
+`obe_hand_written_sim_tests`, `obe_hand_written_store_tests` and
+`obe_hand_written_net_tests`) from the same sources as the reference tests.
+They carry the `ctest` label `hand-written` and, in `ctest`'s own listing, the
+prefix `hand_written.` on their names. The prefix is not decoration. A test
+that does not depend on the implementation has the same name in both
+executables, `ctest` keeps labels by name, and of two tests with one name the
+first ended up carrying the label of the second: a handful of tests were
+counted under the wrong label until the names were made distinct.
 
 ```sh
-ctest --preset debug -LE needs-your-code     # everything that is finished
-ctest --preset debug -L needs-your-code      # the hand-written parts
+ctest --preset debug                         # everything
+ctest --preset debug -L hand-written         # only the hand-written parts
+ctest --preset tsan -L hand-written          # the ring's judge
 ```
-
-Until a container is written its tests fail with a message naming the missing
-function, and `--impl <name>` in the apps exits with status 4. Record the
-decisions you make for each one in sections 6.3 onwards.
-
-The hand-written engine is journaled and recovered by replay as soon as it
-matches: `obe_hand_written_journal_tests` and the second crash test run on it
-under the same label. Saving it to a snapshot is a further step and nothing
-waits on it. It means adding the five functions listed under "Restoring" in
-`engine/concepts.hpp`, then pointing the `Impl` alias at the top of
-`tests/journal/snapshot_test.cpp` at it, which runs that whole suite on the
-new engine. The question worth settling first: when
-orders are restored one at a time into intrusive queues of pooled nodes, what
-has to be true of the pool and the index afterwards for the engine to be
-indistinguishable from one that got there by trading?
 
 ### 6.1 Reference order store
 
@@ -391,69 +376,99 @@ what the baseline measures and what phase 4 replaces one at a time.
 
 ### 6.3 Flat order table
 
-*(yours)*
+Open addressing with linear probing over one array of 24-byte slots (key,
+record, and an occupancy byte that fits in the padding), at most 70% full,
+with Fibonacci hashing (the top bits of key times 2^64/phi) and backward-shift
+deletion. Linear probing because the traffic is lookups that hit, and a short
+probe in consecutive memory beats any scheme that jumps; backward shift
+because an ITCH day inserts and erases hundreds of millions of orders at a
+roughly constant size, which is exactly the workload that drowns a
+tombstone-based table. `prefetch(id)` serves experiment 6.
 
 ### 6.4 Contiguous price levels
 
-*(yours)*
+One sorted vector per side, best price at the back. The side is folded into
+the key (asks are stored as `~price`), so both sides are ascending and the
+loops have no side test. A price is found by scanning the last eight levels
+and only then binary searching, because updates land near the best price. An
+empty side owns no memory. The cost accepted: an update k levels deep moves k
+elements.
 
 ### 6.5 Pool
 
-*(yours)*
+Slabs of a fixed number of slots, a free list threaded through the free slots
+themselves, last freed first reused. Nothing is allocated before the first
+`allocate()`, and nothing is returned before destruction. The slot is at least
+a pointer in size and alignment, so a one-byte object costs eight bytes and a
+page-aligned one a page.
 
 ### 6.6 Matching engine
 
-*(yours)*
+An order is one 64-byte cache line: its neighbours, its level, and what a
+trade reads. What only icebergs need is behind one pointer that is null for
+every other order. Orders and iceberg records come from pools. The id index
+is an array, because the engine hands out dense ids, split into chunks of
+4096 that are freed once every id in them has been issued and none is still
+resting, so memory follows the live span of ids. Levels stay `std::map` so
+that the comparison with the reference isolates the orders, the pool and the
+index. A resting order allocates nothing after warm-up; a new price level
+still costs a tree node. It is Restorable, so snapshots work on it too.
 
 ### 6.7 Lock-free ring
 
-*(yours)*
+Free-running 64-bit indices over a power-of-two buffer, each written by one
+thread; release stores to publish and acquire loads to observe; producer and
+consumer each on a cache line of their own with a cached copy of the other
+side's index; the buffer pointer and the mask, read by both and written by
+neither, on a line of their own. Wait-free: no loop in either operation.
 
 ### 6.8 Avellaneda-Stoikov strategy
 
-*(yours)*
-
-The spec's list of parts to write by hand names the order store, the price
-levels, the queue and the matching loop. This one is not on it. It is left to
-write for the same reason those are: it is the part of the simulator that
-carries the idea, it is about twenty lines, and a strategy that cannot be
-derived at a whiteboard is not one to put a name to. Everything else in the
-simulator runs without it.
+The formula of the paper, as the header's contract states it, with the
+volatility estimated from the mids seen. The spec's list of parts to write by
+hand does not name it; it is here because it is the part of the simulator that
+carries the idea. The header explains each term and says where the simulator
+departs from the model's assumptions: its fills are adversely selected, so the
+model's promised profit is an upper bound.
 
 ### 6.9 Compressing tick codec
 
-*(yours)*
-
-Not on the spec's list either, and left to write for the same reason as the
-strategy: it is the one part of the tick store that is an idea and not
-plumbing. The file, the index, the recovery and the tools are done and tested
-around a codec that does not compress (section 13).
-
-The order of work the header suggests is the reverse of the obvious one. Run
-`tick_store profile` on a real file first, and write down what the table
-says before designing anything: a codec is a bet on that table, and one
-designed from a guess about markets is usually a bet on the wrong thing.
-Then the simplest design that is correct, measured, and after that one
-experiment at a time in [`optimization-log.md`](optimization-log.md), each
-with bytes per tick and ticks per second before and after, and the same file
-through `zstd` beside them.
+A flags byte (which of the four quote fields changed, same security as the
+tick before, and whether each difference is a whole number of cents or round
+lots), a varint for the time difference, the locate only when it changes, and
+zigzag varints of each changed field's difference from that security's last
+quote. Per-security state carries an epoch, so `reset()` at each block start
+costs nothing, and lives in an anonymous mapping, so building a codec (one per
+query) does not write 2 MiB. 7.0 bytes a tick on the generated market of the
+compression test, against 34 for the raw codec; 8.3 before the cents and lots
+bits were added. Real-day figures go in the log.
 
 ### 6.10 io_uring transport
 
-*(yours)*
+Two system calls a turn: one `io_uring_enter` to submit and wait, one to
+submit the turn's sends. A completion's user data is the connection object's
+address with the operation in its low bit. Receives land in a buffer per
+connection; sends read from a buffer that nothing touches until they complete,
+with a second one taking what is queued meanwhile; one send in flight per
+connection. A closed connection with operations in flight is shut down and
+kept as a "zombie" until its last completion, and the destructor drains every
+zombie before any buffer is freed. `flush(id)` sends with `MSG_DONTWAIT` and
+reaps at once, setting aside what is not a send for the next `poll()`.
 
-The comparison the stretch idea asks for is between two transports, and one
-of them is the point of the exercise: the epoll one is the familiar
-mechanism, and the io_uring one is where the thinking is (section 10.6). So
-the rings, the contract, the gateway on top and the reference are done, and
-the transport is left.
+Three mistakes of that design were found while verifying it, each now pinned
+by a transport test: the destructor waited only for new completions, never
+for those `flush` had set aside, so a connection closed right after a flush
+was waited for in vain and leaked; a send that finished inside `flush` with
+more queued behind it prepared the next send without handing it over, so
+`unsent(id)` stayed high after a client had caught up; and a flush from inside
+a callback did not see its own connection's send completion when `poll` had
+collected it behind a receive. The last two matter beyond the numbers: the
+gateway decides that a client is too slow from `unsent` after a flush.
 
-It is the hand-written part with the least margin for a mistake that tests
-cannot see. The tests run under AddressSanitizer, and AddressSanitizer does
-not see a write the kernel makes into memory the program has already freed.
-The questions in the header about what happens to a connection's buffers
-when it is closed with operations in flight are the ones to answer on paper
-before any code.
+AddressSanitizer does not see a write the kernel makes into memory the program
+has already freed, so the tests cannot prove the lifetime rules; the
+quarantine-free run gives such a mistake its best chance of showing, and the
+header argues each rule on paper.
 
 ## 7. Phase 4 structure
 
@@ -1140,10 +1155,10 @@ time, and reports requests per second and system calls per request.
 For epoll the count follows from the code: a request costs a `recv` and a
 `send`, and the `epoll_wait` that found it is shared by everything ready in
 the same turn, so 3 for a request that arrives alone and 2 + 1/K when K
-arrive together, and that is the count the benchmark reports. No number
-exists for the hand-written transport, and no timing taken in the build
-sandbox means anything: the comparison the stretch idea asks for is to be
-made on real hardware, once the transport is written. The
+arrive together, and that is the count the benchmark reports. The io_uring
+transport's design makes it two a turn whatever K is (section 6.10). No
+timing taken in the build sandbox means anything: the comparison the stretch
+idea asks for is made on real hardware (`scripts/real_data_evals.sh`). The
 prediction worth writing down before measuring is in the benchmark's header:
 system calls per request should fall as 1/K, and requests per second should
 move much less than that, because on loopback the kernel's TCP work per
@@ -1159,8 +1174,8 @@ callbacks; a death reported once, by whichever of the two ways finds it; an
 id reused the moment its connection is closed; a connection closed with a
 backlog; and a transport destroyed with connections open and output queued.
 The whole gateway suite of section 10.5 then runs on the same transport.
-Both files are built twice: on `EpollTransport` in the passing suite, and on
-`UringTransport` under `needs-your-code`. `uring_test.cpp` covers the rings
+Both files are built twice: on `EpollTransport` in `obe_net_tests`, and on
+`UringTransport` in `obe_hand_written_net_tests`. `uring_test.cpp` covers the rings
 themselves.
 
 Two things about these tests are there because of what they cannot do.
@@ -1348,9 +1363,9 @@ Both stop adding to a position at a limit, and know nothing else about risk.
 
 **Avellaneda-Stoikov** (`avellaneda_stoikov.hpp`) is the textbook step up: it
 moves both quotes against the position and widens them with volatility and with
-the time left. It is left to be written by hand; its header has the contract,
-the questions to be able to answer, and a test suite whose expected prices are
-worked out by hand in the comments.
+the time left. It is written by hand (section 6.8); its header has the
+contract, what each term means, and where this simulator departs from the
+model, and its tests' expected prices are worked out by hand in the comments.
 
 `EwmaVariance` (`volatility.hpp`) supplies the volatility it needs. The mid is
 observed at irregular times, so the estimate is the sum of squared moves
@@ -1886,8 +1901,8 @@ record` on a real file, and has not been taken.
    with a filter over the full dump; then the file cut short, and a byte of
    one block changed.
 
-The typed suites run on `RawCodec` in the passing build and on `DeltaCodec`
-under the `needs-your-code` label, where `compression_test.cpp` adds the size
+The typed suites run on `RawCodec`, and on `DeltaCodec` in
+`obe_hand_written_store_tests`, where `compression_test.cpp` adds the size
 target.
 
 What none of this measures is a real day: how many ticks one has, what the
@@ -2065,8 +2080,8 @@ revisit.
 10. One disk on one machine. A journal protects against the process and the
     machine stopping, not against the disk dying: that takes a second copy
     somewhere else, written before a request is acknowledged.
-11. Snapshots work for the reference engine only, until the hand-written
-    engine is given the five `Restorable` functions.
+11. A snapshot is written whole every time: there is no incremental one, so
+    the time to take it grows with the number of resting orders.
 12. The order types stop at limit and market, three times in force, and the
     three instructions of section 8.6. No stop orders, no pegged orders, no
     minimum quantity, no auctions. The gateway's Accepted message does not
@@ -2074,10 +2089,9 @@ revisit.
 13. A tick store is written once. Nothing appends to a finished store, joins
     two, or splits one, and a query for one security reads every block in its
     range of time (section 14, item 24).
-14. Until the hand-written codec exists a store is 34 bytes a tick, and the
-    only compression figure is the target on generated ticks. Nothing has
-    been recorded from a real day: not the number of ticks, not their
-    profile, not a file size.
+14. The compression figures (7.0 bytes a tick for the delta codec, 34 raw)
+    are from generated ticks. Nothing has been recorded from a real day: not
+    the number of ticks, not their profile, not a file size.
 15. The tick store is not connected to the live programs. `tick_store record`
     replays a file. `md_listen` could record what it receives through the
     same `TickRecorder`, and does not.

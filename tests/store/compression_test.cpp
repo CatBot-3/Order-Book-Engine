@@ -24,8 +24,8 @@
 //
 // Ten bytes a tick is a first target, not a good result: it is 3.4 times
 // smaller than RawCodec's 34, and the plainest design that takes differences
-// and writes them as varints gets under it. The questions in delta_codec.hpp
-// are about how far below it you can go.
+// and writes them as varints gets under it. The DESIGN section of
+// delta_codec.hpp says how far below it this codec goes, and by what.
 
 namespace {
 

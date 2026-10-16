@@ -19,11 +19,11 @@
 // price to work around, and a fixture that gives every request its own time
 // and keeps everything the engine says.
 //
-// The suites built on it are typed over ScenarioEngines. In the passing build
+// The suites built on it are typed over ScenarioEngines. In the reference build
 // that is the reference engine and the test oracle (support/naive_engine.hpp):
 // the property tests use the oracle to judge the reference on random flow,
 // which is only worth something if the oracle itself agrees with the
-// hand-worked cases. In the needs-your-code build it is the hand-written
+// hand-worked cases. In the hand-written build it is the hand-written
 // engine.
 
 namespace obe::test::scenario {
