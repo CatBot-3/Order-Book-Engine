@@ -8,8 +8,7 @@
 #
 # With no --engine, every engine `flow_gen --list` names is checked. Anything
 # after "--" is passed to flow_gen, for both runs.
-# Exit status: 0 all identical, 1 a difference or an error, 4 an engine is not
-# written yet.
+# Exit status: 0 all identical, 1 a difference or an error.
 set -euo pipefail
 
 FLOW_GEN=""
@@ -21,7 +20,7 @@ while [[ $# -gt 0 ]]; do
         --flow-gen) FLOW_GEN="$2"; shift 2 ;;
         --engine) ENGINES+=("$2"); shift 2 ;;
         --) shift; OPTIONS=("$@"); break ;;
-        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
@@ -50,11 +49,6 @@ for name in "${ENGINES[@]}"; do
     output="$("$FLOW_GEN" --engine "$name" "${OPTIONS[@]}" 2>&1)"
     status=$?
     set -e
-    if [[ "$status" -eq 4 ]]; then
-        echo "  not written yet: $(grep -m1 'not built yet' <<<"$output" | sed 's/^not built yet: //')"
-        [[ "$worst" -eq 0 ]] && worst=4
-        continue
-    fi
     if [[ "$status" -ne 0 ]]; then
         echo "  FAILED: flow_gen exited with status $status"
         sed 's/^/    /' <<<"$output" | tail -n 12

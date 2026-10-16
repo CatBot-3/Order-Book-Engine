@@ -23,10 +23,9 @@
 //
 // tests/net/transport_test.cpp and gateway_test.cpp are built twice:
 //
-//   obe_net_tests                the reference transport (epoll).
-//   obe_hand_written_net_tests   built with OBE_TEST_URING defined: the
-//                                hand-written io_uring transport. Labelled
-//                                hand-written.
+//   obe_net_tests        the reference transport (epoll).
+//   obe_core_net_tests   built with OBE_TEST_URING defined: the io_uring
+//                        transport. Labelled core.
 
 // What a test does when the thing it tests says it cannot run on this system.
 //

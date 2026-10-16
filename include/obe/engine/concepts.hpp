@@ -12,9 +12,9 @@
 // The matching engine's contract, and the two things it talks to.
 //
 // There are two engines behind this contract. ReferenceEngine is built from
-// standard containers and is the definition of correct. MatchingEngine is the
-// one written by hand for speed. Anything here that the reference does, the
-// hand-written engine must do identically, down to the order of its output:
+// standard containers and is the definition of correct. MatchingEngine, the
+// pooled engine, is built for speed. Anything here that the reference does,
+// the pooled engine must do identically, down to the order of its output:
 // the differential test compares their market data byte for byte and their
 // reports one by one.
 //

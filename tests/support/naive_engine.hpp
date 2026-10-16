@@ -17,8 +17,8 @@
 
 // A second, independent matching engine, used only as an oracle.
 //
-// The reference engine is the judge of the hand-written one, so something has
-// to judge the reference. This does, the same way NaiveBook judges the
+// The reference engine is the judge of the pooled engine, so something has to
+// judge the reference. This does, the same way NaiveBook judges the
 // reference book: it implements the contract in obe/engine/concepts.hpp with
 // no data structure at all. Every resting order of every instrument sits in
 // one vector, in the order it joined the book. Finding who trades next is a

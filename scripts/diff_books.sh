@@ -10,8 +10,7 @@
 #   scripts/diff_books.sh --replay <book_replay> --synth <itch_synth>
 #
 # With no --impl, every implementation `book_replay --list` names is checked.
-# Exit status: 0 all identical, 1 a difference or an error, 4 an implementation
-# is not written yet.
+# Exit status: 0 all identical, 1 a difference or an error.
 set -euo pipefail
 
 REPLAY=""
@@ -29,7 +28,7 @@ while [[ $# -gt 0 ]]; do
         --impl) IMPLS+=("$2"); shift 2 ;;
         --reserve) RESERVE="$2"; shift 2 ;;
         --workdir) WORKDIR="$2"; shift 2 ;;
-        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
@@ -67,11 +66,6 @@ for impl in "${IMPLS[@]}"; do
     "$REPLAY" --impl "$impl" "${extra[@]}" --hashes "$hashes" "$FILE" >"$log" 2>&1
     status=$?
     set -e
-    if [[ "$status" -eq 4 ]]; then
-        echo "  not written yet: $(grep -m1 'not built yet' "$log" | sed 's/^not built yet: //')"
-        [[ "$worst" -eq 0 ]] && worst=4
-        continue
-    fi
     if [[ "$status" -ne 0 ]]; then
         echo "  FAILED: book_replay exited with status $status"
         sed 's/^/    /' "$log" | tail -n 12

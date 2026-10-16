@@ -28,8 +28,8 @@
 // answers the next request differently.
 //
 // These run on the reference engine in obe_journal_tests, and again on the
-// pooled MatchingEngine in obe_hand_written_journal_tests, which is built with
-// OBE_TEST_HAND_WRITTEN defined. Both engines are Restorable.
+// pooled MatchingEngine in obe_core_journal_tests, which is built with
+// OBE_TEST_CORE defined. Both engines are Restorable.
 
 namespace {
 
@@ -40,7 +40,7 @@ using journal::SnapshotOrder;
 using test::Recorded;
 using test::same_state;
 
-#if defined(OBE_TEST_HAND_WRITTEN)
+#if defined(OBE_TEST_CORE)
 using Impl = engine::PooledEngineImpl;
 #else
 using Impl = engine::ReferenceEngineImpl;

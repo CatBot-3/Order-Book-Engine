@@ -12,8 +12,7 @@
 #
 #   scripts/flow_round_trip.sh <flow_gen> <book_replay> [workdir] [flow_gen options...]
 #
-# Exit status: 0 all three hold, 1 one of them does not, 4 the engine named
-# with --engine is not written yet.
+# Exit status: 0 all three hold, 1 one of them does not.
 set -euo pipefail
 
 FLOW_GEN="$1"
@@ -31,9 +30,6 @@ run_flow "$@" "$FILE" >"$WORKDIR/flow_round_trip_1.txt" 2>&1
 status=$?
 set -e
 cat "$WORKDIR/flow_round_trip_1.txt"
-if [[ "$status" -eq 4 ]]; then
-    exit 4
-fi
 if [[ "$status" -ne 0 ]]; then
     echo "error: flow_gen exited with status $status" >&2
     exit 1

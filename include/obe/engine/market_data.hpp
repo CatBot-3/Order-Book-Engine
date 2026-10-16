@@ -10,7 +10,7 @@
 // Builders for the ITCH messages an engine publishes, and two small rules both
 // engines share.
 //
-// These are here so that the reference engine and the hand-written one cannot
+// These are here so that the reference engine and the pooled engine cannot
 // disagree about a field nobody meant to vary: the differential test compares
 // their feeds byte for byte, and a difference in the round-lot size of a Stock
 // Directory would be a failure that teaches nothing.

@@ -31,9 +31,9 @@
 //
 // Exit status
 //   run    0 the journal holds all the requests, 1 usage or I/O error,
-//          3 the journal cannot be carried on, 4 the engine is not written yet
+//          3 the journal cannot be carried on
 //   check  0 clean end, 2 torn tail (a run would cut it and carry on),
-//          3 the journal cannot be used, 1 and 4 as above
+//          3 the journal cannot be used, 1 as above
 //   dump   0, or 1, 2 and 3 as for check
 
 #include <signal.h>
@@ -66,7 +66,6 @@
 #include "obe/journal/writer.hpp"
 #include "obe/util/format.hpp"
 #include "obe/util/mapped_file.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -661,9 +660,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

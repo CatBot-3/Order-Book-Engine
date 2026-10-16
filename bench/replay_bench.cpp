@@ -24,8 +24,7 @@
 // docs/benchmark-method.md. Read that before quoting a number from here.
 //
 // Exit status: 0 ok, 1 usage or I/O error, 2 the file is truncated or corrupt,
-// 3 the book violated its invariants or disagreed with the reference, 4 the
-// chosen implementation is not written yet.
+// 3 the book violated its invariants or disagreed with the reference.
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -62,7 +61,6 @@
 #include "obe/util/latency_histogram.hpp"
 #include "obe/util/mapped_file.hpp"
 #include "obe/util/perf_counters.hpp"
-#include "obe/util/todo.hpp"
 
 #include "bench_env.hpp"
 #include "bench_input.hpp"
@@ -919,13 +917,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr,
-                     "not built yet: %s\n"
-                     "The reference book (--impl reference) and the feed layer (--handler parse) "
-                     "can be measured now.\n",
-                     e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

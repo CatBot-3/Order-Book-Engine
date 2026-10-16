@@ -490,10 +490,10 @@ stage_tsan() {
     # OBE_CMAKE_ARGS is meant to be split into words.
     # shellcheck disable=SC2086
     run cmake --preset tsan -B "$build" -DOBE_WARNINGS_AS_ERRORS=OFF ${OBE_CMAKE_ARGS:-} >"$1/configure.txt" 2>&1 || { cat "$1/configure.txt"; return 1; }
-    run cmake --build "$build" --target obe_concurrency_tests obe_hand_written_concurrency_tests 2>&1 |
+    run cmake --build "$build" --target obe_concurrency_tests obe_core_concurrency_tests 2>&1 |
         tail -n 3
     local failed=0
-    for t in obe_concurrency_tests obe_hand_written_concurrency_tests; do
+    for t in obe_concurrency_tests obe_core_concurrency_tests; do
         TSAN_OPTIONS=halt_on_error=1 run "$build/tests/$t" >"$1/$t.txt" 2>&1 || failed=1
         grep -E "PASSED|FAILED|ThreadSanitizer" "$1/$t.txt" | head -n 5
     done

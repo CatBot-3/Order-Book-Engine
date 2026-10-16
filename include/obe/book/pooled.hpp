@@ -17,7 +17,7 @@
 // std::map, the same code in order_store.hpp and price_levels.hpp. Only the
 // source of node memory differs. That makes this the cleanest measurement of
 // what the general-purpose allocator was costing the reference, separate from
-// what its pointer-chasing layout costs. They work once util::Pool is written.
+// what its pointer-chasing layout costs.
 
 namespace obe::book {
 

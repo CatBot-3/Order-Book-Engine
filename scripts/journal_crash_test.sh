@@ -30,8 +30,7 @@
 # The kills are chosen by $RANDOM from [seed], which is printed, so a failure
 # can be repeated.
 #
-# Exit status: 0 all of that held, 1 something did not, 4 the engine named is
-# not written yet.
+# Exit status: 0 all of that held, 1 something did not.
 set -uo pipefail
 
 BIN="$1"
@@ -82,10 +81,6 @@ run_until_done() {
         case $status in
             0) return 0 ;;
             137) KILLS=$((KILLS + 1)) ;;
-            4)
-                cat "$WORKDIR/$name.err" >&2
-                exit 4
-                ;;
             *)
                 cat "$WORKDIR/$name.out" "$WORKDIR/$name.err" >&2
                 fail "$name: round $round (kill at write $at, keep $keep%) ended with status $status"
@@ -100,10 +95,6 @@ echo "journal crash test: engine $ENGINE, seed $SEED"
 # 1. Never killed.
 "$BIN" run "${FLOW[@]}" --journal "$WORKDIR/ref.j" >"$WORKDIR/ref.out" 2>"$WORKDIR/ref.err"
 status=$?
-if [ $status -eq 4 ]; then
-    cat "$WORKDIR/ref.err" >&2
-    exit 4
-fi
 [ $status -eq 0 ] || fail "the run that is never killed failed (status $status)"
 REF=$(digest_of "$WORKDIR/ref.out")
 [ -n "$REF" ] || fail "the reference run printed no digest"

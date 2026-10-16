@@ -10,15 +10,15 @@ function(obe_add_test name)
   target_link_libraries(${name} PRIVATE obe::obe GTest::gtest GTest::gmock GTest::gtest_main)
   target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   # Several suites are built twice from the same sources, once on the
-  # reference implementation and once on a hand-written one, and a test that
-  # does not depend on the implementation has the same name in both. ctest
-  # keeps its properties by name: of two tests with one name, the first ends
-  # up with the labels of the second, and a test would be counted under the
-  # wrong label. So the hand-written copies carry a prefix and every name is
-  # its own.
+  # reference implementation and once on one of the core parts, and a test
+  # that does not depend on the implementation has the same name in both.
+  # ctest keeps its properties by name: of two tests with one name, the first
+  # ends up with the labels of the second, and a test would be counted under
+  # the wrong label. So the copies built on the core parts carry a prefix and
+  # every name is its own.
   set(prefix "")
-  if("hand-written" IN_LIST ARG_LABELS)
-    set(prefix "hand_written.")
+  if("core" IN_LIST ARG_LABELS)
+    set(prefix "core.")
   endif()
   # The timeout turns a container that has stopped making progress (an
   # open-addressing table clogged with deleted markers, say) into a failure
@@ -30,7 +30,7 @@ function(obe_add_test name)
     PROPERTIES LABELS "${ARG_LABELS}" TIMEOUT 300)
 endfunction()
 
-# Everything that is complete. These pass on a fresh clone.
+# The feed layer, the utilities and the book's building blocks.
 obe_add_test(
   obe_tests
   LABELS unit
@@ -51,26 +51,25 @@ set(OBE_BOOK_TEST_SOURCES book/order_store_test.cpp book/price_levels_test.cpp
                           book/book_manager_test.cpp book/book_replay_test.cpp)
 obe_add_test(obe_book_tests LABELS unit SOURCES ${OBE_BOOK_TEST_SOURCES})
 
-# The same book tests again, on the phase 4 containers that are written by hand
+# The same book tests again, on the optimized containers of phase 4
 # (FlatOrderStore, VectorPriceLevels, util::Pool), plus the tests that only
 # make sense for them: the differential check against the reference, and the
 # pool's own suite.
 #
-# Everything built this way, for the eight hand-written parts, carries the
-# label hand-written:
+# Everything built this way, for the eight core parts, carries the label core:
 #
-#   ctest --preset debug                     everything
-#   ctest --preset debug -L hand-written     only the hand-written parts
-#   ctest --preset debug -LE hand-written    only the reference versions
+#   ctest --preset debug             everything
+#   ctest --preset debug -L core     only the core parts
+#   ctest --preset debug -LE core    only the reference versions
 obe_add_test(
-  obe_hand_written_tests
-  LABELS hand-written
+  obe_core_tests
+  LABELS core
   SOURCES ${OBE_BOOK_TEST_SOURCES} book/differential_test.cpp util/pool_test.cpp)
-target_compile_definitions(obe_hand_written_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+target_compile_definitions(obe_core_tests PRIVATE OBE_TEST_CORE)
 
 # The matching engine (phase 5). The same split as the book: the suites run on
-# the reference engine, and again on the hand-written
-# MatchingEngine, with the differential test against the reference added.
+# the reference engine, and again on the pooled engine (MatchingEngine), with
+# the differential test against the reference added.
 set(OBE_ENGINE_TEST_SOURCES engine/engine_scenario_test.cpp engine/instructions_test.cpp
                             engine/engine_property_test.cpp engine/round_trip_test.cpp)
 obe_add_test(
@@ -79,24 +78,22 @@ obe_add_test(
   SOURCES ${OBE_ENGINE_TEST_SOURCES} engine/feed_writer_test.cpp gen/order_flow_test.cpp)
 
 obe_add_test(
-  obe_hand_written_engine_tests
-  LABELS hand-written
+  obe_core_engine_tests
+  LABELS core
   SOURCES ${OBE_ENGINE_TEST_SOURCES} engine/engine_differential_test.cpp)
-target_compile_definitions(obe_hand_written_engine_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+target_compile_definitions(obe_core_engine_tests PRIVATE OBE_TEST_CORE)
 
 # Queues, the seqlock and the three-thread pipeline (phase 6). The same split
-# again: the suites run on the mutex queue, and on the hand-written lock-free
-# ring. Run both under the
-# tsan preset as well: that is where a wrong memory ordering shows.
+# again: the suites run on the mutex queue, and on the lock-free ring. Run both
+# under the tsan preset as well: that is where a wrong memory ordering shows.
 set(OBE_QUEUE_TEST_SOURCES util/queue_test.cpp util/channel_test.cpp pipeline/pipeline_test.cpp)
 obe_add_test(obe_concurrency_tests LABELS unit SOURCES ${OBE_QUEUE_TEST_SOURCES}
                                                        util/seqlock_test.cpp)
 target_link_libraries(obe_concurrency_tests PRIVATE Threads::Threads)
 
-obe_add_test(obe_hand_written_concurrency_tests LABELS hand-written SOURCES
-             ${OBE_QUEUE_TEST_SOURCES})
-target_link_libraries(obe_hand_written_concurrency_tests PRIVATE Threads::Threads)
-target_compile_definitions(obe_hand_written_concurrency_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+obe_add_test(obe_core_concurrency_tests LABELS core SOURCES ${OBE_QUEUE_TEST_SOURCES})
+target_link_libraries(obe_core_concurrency_tests PRIVATE Threads::Threads)
+target_compile_definitions(obe_core_concurrency_tests PRIVATE OBE_TEST_CORE)
 
 # The network layer (phase 7): the wire formats, the packet sequencing, and the
 # gateway over real loopback sockets.
@@ -106,13 +103,12 @@ obe_add_test(
   SOURCES net/protocol_test.cpp net/moldudp_test.cpp net/udp_test.cpp net/gateway_test.cpp
           net/open_loop_test.cpp net/out_buffer_test.cpp net/transport_test.cpp net/uring_test.cpp)
 
-# The transport contract and the whole gateway again, on the hand-written
-# io_uring transport (stretch idea 4). They skip themselves where the kernel
-# or a sandbox does not allow io_uring, so look at the count of tests that
-# ran, not only at the colour.
-obe_add_test(obe_hand_written_net_tests LABELS hand-written SOURCES net/transport_test.cpp
-             net/gateway_test.cpp)
-target_compile_definitions(obe_hand_written_net_tests PRIVATE OBE_TEST_URING)
+# The transport contract and the whole gateway again, on the io_uring
+# transport (stretch idea 4). They skip themselves where the kernel or a
+# sandbox does not allow io_uring, so look at the count of tests that ran, not
+# only at the colour.
+obe_add_test(obe_core_net_tests LABELS core SOURCES net/transport_test.cpp net/gateway_test.cpp)
+target_compile_definitions(obe_core_net_tests PRIVATE OBE_TEST_URING)
 
 # Does io_uring work on the machine this is being configured on? A small
 # program that shares no code with the library finds out, once. Where it does
@@ -128,14 +124,14 @@ if(NOT CMAKE_CROSSCOMPILING)
   if(OBE_IO_URING_PROBE_BUILT AND "${OBE_IO_URING_PROBE_EXIT}" STREQUAL "0")
     message(STATUS "io_uring works here: its tests will fail, not skip, if it stops working")
     target_compile_definitions(obe_net_tests PRIVATE OBE_IO_URING_WORKS_HERE)
-    target_compile_definitions(obe_hand_written_net_tests PRIVATE OBE_IO_URING_WORKS_HERE)
+    target_compile_definitions(obe_core_net_tests PRIVATE OBE_IO_URING_WORKS_HERE)
   else()
     message(STATUS "io_uring does not work here: its tests will skip themselves")
   endif()
 endif()
 
-# The hand-written transport's tests once more, with the sanitizer told to
-# hand freed memory straight back to the allocator. AddressSanitizer normally
+# The io_uring transport's tests once more, with the sanitizer told to hand
+# freed memory straight back to the allocator. AddressSanitizer normally
 # keeps freed memory aside, untouched, for a while (its "quarantine"). That is
 # what lets it catch the program's own use of freed memory, and it is also
 # what hides the one mistake that matters most here: a buffer freed or moved
@@ -146,44 +142,43 @@ endif()
 #
 # Where io_uring cannot be used every test in it skips itself, and the run is
 # reported as skipped and not as passed.
-add_test(NAME hand_written_net_tests_without_quarantine COMMAND obe_hand_written_net_tests)
+add_test(NAME core_net_tests_without_quarantine COMMAND obe_core_net_tests)
 set_tests_properties(
-  hand_written_net_tests_without_quarantine
-  PROPERTIES LABELS "hand-written" TIMEOUT 600 ENVIRONMENT
+  core_net_tests_without_quarantine
+  PROPERTIES LABELS "core" TIMEOUT 600 ENVIRONMENT
              "ASAN_OPTIONS=quarantine_size_mb=0:thread_local_quarantine_size_kb=0"
              SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
 # The market-making simulator: the fill model on hand-built messages, its
 # accounting over generated flow, and the strategies. The Avellaneda-Stoikov
-# strategy is written by hand and has its own executable.
+# strategy is one of the core parts and has its own executable.
 obe_add_test(
   obe_sim_tests
   LABELS unit
   SOURCES sim/sim_scenario_test.cpp sim/sim_property_test.cpp sim/strategy_test.cpp)
-obe_add_test(obe_hand_written_sim_tests LABELS hand-written SOURCES
-             sim/avellaneda_stoikov_test.cpp)
+obe_add_test(obe_core_sim_tests LABELS core SOURCES sim/avellaneda_stoikov_test.cpp)
 
 # The journal (stretch idea 1): the file format and its reader, recovery by
 # replay, snapshots, and the file layer. Recovery and snapshots are built a
-# second time for the hand-written engine, which is Restorable too.
+# second time for the pooled engine, which is Restorable too.
 obe_add_test(
   obe_journal_tests
   LABELS unit
   SOURCES journal/journal_format_test.cpp journal/recovery_test.cpp journal/snapshot_test.cpp
           journal/journal_file_test.cpp)
-obe_add_test(obe_hand_written_journal_tests LABELS hand-written SOURCES
-             journal/recovery_test.cpp journal/snapshot_test.cpp)
-target_compile_definitions(obe_hand_written_journal_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+obe_add_test(obe_core_journal_tests LABELS core SOURCES journal/recovery_test.cpp
+             journal/snapshot_test.cpp)
+target_compile_definitions(obe_core_journal_tests PRIVATE OBE_TEST_CORE)
 
 # The tick store (stretch idea 3): the codec contract and the file around it,
-# typed over the codec. They run on RawCodec, and again on the hand-written
-# DeltaCodec with the compression target added.
+# typed over the codec. They run on RawCodec, and again on the compressing
+# codec (DeltaCodec) with the compression target added.
 set(OBE_STORE_TEST_SOURCES store/tick_codec_test.cpp store/tick_file_test.cpp)
 obe_add_test(obe_store_tests LABELS unit SOURCES ${OBE_STORE_TEST_SOURCES}
                                                  store/tick_profile_test.cpp)
-obe_add_test(obe_hand_written_store_tests LABELS hand-written SOURCES
-             ${OBE_STORE_TEST_SOURCES} store/compression_test.cpp store/delta_codec_test.cpp)
-target_compile_definitions(obe_hand_written_store_tests PRIVATE OBE_TEST_HAND_WRITTEN)
+obe_add_test(obe_core_store_tests LABELS core SOURCES ${OBE_STORE_TEST_SOURCES}
+             store/compression_test.cpp store/delta_codec_test.cpp)
+target_compile_definitions(obe_core_store_tests PRIVATE OBE_TEST_CORE)
 
 # The integration tests below are shell scripts. They are run through bash
 # explicitly so they work on a checkout that lost its executable bits, which is
@@ -267,7 +262,7 @@ if(OBE_BUILD_APPS AND OBE_BASH)
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/diff_books.sh" --replay
       $<TARGET_FILE:book_replay> --synth $<TARGET_FILE:itch_synth> --workdir
       "${CMAKE_CURRENT_BINARY_DIR}")
-  set_tests_properties(optimized_books_match_reference PROPERTIES LABELS "hand-written")
+  set_tests_properties(optimized_books_match_reference PROPERTIES LABELS "core")
 endif()
 
 # Success criterion 7 through the real apps: the matching engine's published
@@ -281,19 +276,19 @@ if(OBE_BUILD_APPS AND OBE_BASH)
       $<TARGET_FILE:book_replay> "${CMAKE_CURRENT_BINARY_DIR}")
   set_tests_properties(engine_feed_round_trip PROPERTIES LABELS "integration")
 
-  # The same, for the hand-written engine, and its output against the
-  # reference engine's.
+  # The same, for the pooled engine, and its output against the reference
+  # engine's.
   add_test(
-    NAME hand_written_engine_feed_round_trip
+    NAME pooled_engine_feed_round_trip
     COMMAND
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/flow_round_trip.sh" $<TARGET_FILE:flow_gen>
       $<TARGET_FILE:book_replay> "${CMAKE_CURRENT_BINARY_DIR}" --engine pooled)
-  set_tests_properties(hand_written_engine_feed_round_trip PROPERTIES LABELS "hand-written")
+  set_tests_properties(pooled_engine_feed_round_trip PROPERTIES LABELS "core")
 
   add_test(NAME engines_match_reference
            COMMAND "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/diff_engines.sh" --flow-gen
                    $<TARGET_FILE:flow_gen>)
-  set_tests_properties(engines_match_reference PROPERTIES LABELS "hand-written")
+  set_tests_properties(engines_match_reference PROPERTIES LABELS "core")
 endif()
 
 if(OBE_BUILD_BENCH AND OBE_BASH)
@@ -328,7 +323,7 @@ if(OBE_BUILD_BENCH AND OBE_BASH)
     COMMAND
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/queue_bench_smoke.sh" ring
       $<TARGET_FILE:queue_bench> "${CMAKE_CURRENT_BINARY_DIR}" --queue ring)
-  set_tests_properties(queue_bench_ring_smoke PROPERTIES LABELS "hand-written")
+  set_tests_properties(queue_bench_ring_smoke PROPERTIES LABELS "core")
 endif()
 
 # The pipeline benchmark runs end to end and its output equals the single
@@ -348,7 +343,7 @@ if(OBE_BUILD_APPS AND OBE_BUILD_BENCH AND OBE_BASH)
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/pipeline_bench_smoke.sh" ring
       $<TARGET_FILE:flow_gen> $<TARGET_FILE:pipeline_bench> "${CMAKE_CURRENT_BINARY_DIR}"
       --queue ring)
-  set_tests_properties(pipeline_bench_ring_smoke PROPERTIES LABELS "hand-written")
+  set_tests_properties(pipeline_bench_ring_smoke PROPERTIES LABELS "core")
 endif()
 
 # Success criterion 8 in miniature: the exchange, a market-data subscriber and
@@ -363,26 +358,25 @@ if(OBE_BUILD_APPS AND OBE_BASH)
   # They bind loopback ports; let nothing else run beside them.
   set_tests_properties(gateway_smoke PROPERTIES LABELS "integration" RUN_SERIAL TRUE)
 
-  # The same three programs with the exchange on the hand-written io_uring
-  # transport. Status 5 is the exchange saying that io_uring cannot be used
-  # on this system, which is nothing a test can hold against it.
+  # The same three programs with the exchange on the io_uring transport.
+  # Status 5 is the exchange saying that io_uring cannot be used on this
+  # system, which is nothing a test can hold against it.
   add_test(
     NAME gateway_uring_smoke
     COMMAND
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/gateway_smoke.sh"
       $<TARGET_FILE:exchange_server> $<TARGET_FILE:load_gen> $<TARGET_FILE:md_listen>
       "${CMAKE_CURRENT_BINARY_DIR}" --io uring)
-  set_tests_properties(gateway_uring_smoke PROPERTIES LABELS "hand-written" RUN_SERIAL TRUE
+  set_tests_properties(gateway_uring_smoke PROPERTIES LABELS "core" RUN_SERIAL TRUE
                                                       SKIP_RETURN_CODE 5)
 
   add_test(
-    NAME hand_written_engine_gateway_smoke
+    NAME pooled_engine_gateway_smoke
     COMMAND
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/gateway_smoke.sh"
       $<TARGET_FILE:exchange_server> $<TARGET_FILE:load_gen> $<TARGET_FILE:md_listen>
       "${CMAKE_CURRENT_BINARY_DIR}" --engine pooled)
-  set_tests_properties(hand_written_engine_gateway_smoke PROPERTIES LABELS "hand-written"
-                                                                    RUN_SERIAL TRUE)
+  set_tests_properties(pooled_engine_gateway_smoke PROPERTIES LABELS "core" RUN_SERIAL TRUE)
 endif()
 
 # The market-making simulator through the real programs, on a generated
@@ -404,13 +398,13 @@ if(Python3_Interpreter_FOUND AND OBE_BUILD_APPS AND OBE_BASH)
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/mm_sim_smoke.sh" $<TARGET_FILE:flow_gen>
       $<TARGET_FILE:mm_sim> "${CMAKE_CURRENT_BINARY_DIR}/mm_sim_as_smoke" --strategy as
       --max-tau 1)
-  set_tests_properties(mm_sim_avellaneda_stoikov_smoke PROPERTIES LABELS "hand-written")
+  set_tests_properties(mm_sim_avellaneda_stoikov_smoke PROPERTIES LABELS "core")
 endif()
 
 # The journal through the real program: an engine that is killed with SIGKILL
 # in the middle of its writes, again and again, must end with the journal a
 # run that was never killed writes, byte for byte. The second test is the same
-# on the hand-written engine, which recovers by replay like any other.
+# on the pooled engine, which recovers by replay like any other.
 if(OBE_BUILD_APPS AND OBE_BASH)
   add_test(
     NAME journal_crash_test
@@ -420,18 +414,17 @@ if(OBE_BUILD_APPS AND OBE_BASH)
   set_tests_properties(journal_crash_test PROPERTIES LABELS "integration")
 
   add_test(
-    NAME journal_crash_test_hand_written_engine
+    NAME journal_crash_test_pooled_engine
     COMMAND
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/journal_crash_test.sh"
       $<TARGET_FILE:engine_journal> "${CMAKE_CURRENT_BINARY_DIR}/journal_crash_test_pooled"
       20261006 pooled)
-  set_tests_properties(journal_crash_test_hand_written_engine PROPERTIES LABELS
-                                                                          "hand-written")
+  set_tests_properties(journal_crash_test_pooled_engine PROPERTIES LABELS "core")
 endif()
 
 # The tick store through the real program: a generated feed recorded, checked
 # against the feed, queried by time, then cut short and damaged. The second
-# test is the same with the hand-written codec.
+# test is the same with the compressing codec.
 if(OBE_BUILD_APPS AND OBE_BASH)
   add_test(
     NAME tick_store_smoke
@@ -445,7 +438,7 @@ if(OBE_BUILD_APPS AND OBE_BASH)
     COMMAND
       "${OBE_BASH}" "${PROJECT_SOURCE_DIR}/scripts/tick_store_smoke.sh" $<TARGET_FILE:itch_synth>
       $<TARGET_FILE:tick_store> "${CMAKE_CURRENT_BINARY_DIR}/tick_store_smoke" delta)
-  set_tests_properties(tick_store_delta_smoke PROPERTIES LABELS "hand-written")
+  set_tests_properties(tick_store_delta_smoke PROPERTIES LABELS "core")
 endif()
 
 # The tick benchmark runs end to end, and every store it builds gives back the
@@ -456,7 +449,7 @@ if(OBE_BUILD_BENCH)
   set_tests_properties(tick_bench_smoke PROPERTIES LABELS "integration")
   add_test(NAME tick_bench_delta_smoke COMMAND tick_bench --codec delta --ticks 30000 --queries
                                                50 --runs 1)
-  set_tests_properties(tick_bench_delta_smoke PROPERTIES LABELS "hand-written")
+  set_tests_properties(tick_bench_delta_smoke PROPERTIES LABELS "core")
 endif()
 
 # The transport benchmark runs end to end and every answer is the request it
@@ -467,6 +460,5 @@ if(OBE_BUILD_BENCH)
   set_tests_properties(transport_bench_smoke PROPERTIES LABELS "integration")
   add_test(NAME transport_bench_uring_smoke COMMAND transport_bench --io uring --connections 1,8
                                                     --requests 4000 --runs 1)
-  set_tests_properties(transport_bench_uring_smoke PROPERTIES LABELS "hand-written"
-                                                              SKIP_RETURN_CODE 5)
+  set_tests_properties(transport_bench_uring_smoke PROPERTIES LABELS "core" SKIP_RETURN_CODE 5)
 endif()

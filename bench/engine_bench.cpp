@@ -39,8 +39,7 @@
 // before and after (throughput), one with a clock read per request (latency).
 // docs/benchmark-method.md applies; read it before quoting a number.
 //
-// Exit status: 0 ok, 1 usage error, 3 the engine disagreed with the reference,
-// 4 the chosen engine is not written yet.
+// Exit status: 0 ok, 1 usage error, 3 the engine disagreed with the reference.
 
 #include <array>
 #include <charconv>
@@ -67,7 +66,6 @@
 #include "obe/util/format.hpp"
 #include "obe/util/huge_pages.hpp"
 #include "obe/util/latency_histogram.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -669,9 +667,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

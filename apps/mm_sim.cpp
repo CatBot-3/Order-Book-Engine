@@ -27,8 +27,7 @@
 // obe/sim/simulator.hpp and in docs/design.md, and the report repeats them.
 //
 // Exit status: 0 clean, 1 usage or I/O error, 2 the file is truncated or
-// corrupt, 3 the symbol is not in the file or the report contradicts itself,
-// 4 the chosen strategy is not written yet.
+// corrupt, 3 the symbol is not in the file or the report contradicts itself.
 
 #include <cerrno>
 #include <charconv>
@@ -51,7 +50,6 @@
 #include "obe/sim/types.hpp"
 #include "obe/util/format.hpp"
 #include "obe/util/mapped_file.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -479,9 +477,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

@@ -18,7 +18,7 @@
 // wait on, that can be closed by its producer and cancelled by anybody.
 //
 // In obe_concurrency_tests it runs on the mutex queue, sleeping and spinning. In
-// the hand-written suite it runs on the lock-free ring behind SpinChannel,
+// obe_core_concurrency_tests it runs on the lock-free ring behind SpinChannel,
 // which is how the pipeline uses the ring.
 
 namespace {

@@ -12,7 +12,7 @@
 #include "support/flow_run.hpp"
 #include "support/tick_streams.hpp"
 
-// The target for the hand-written codec. Correctness is judged elsewhere
+// The target for the compressing codec. Correctness is judged elsewhere
 // (tick_codec_test.cpp, tick_file_test.cpp): a codec that fails those is
 // wrong, and how small its output is does not matter. This file asks only how
 // small.

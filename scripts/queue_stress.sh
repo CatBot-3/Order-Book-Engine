@@ -17,8 +17,7 @@
 # because the hardware orders more than the language requires. ThreadSanitizer
 # checks the ordering the code actually asked for.
 #
-# Exit status: 0 every item arrived in order, 3 one did not, 4 the queue is
-# not written yet.
+# Exit status: 0 every item arrived in order, 3 one did not.
 set -euo pipefail
 
 BENCH="$1"

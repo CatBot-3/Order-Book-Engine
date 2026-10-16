@@ -10,8 +10,7 @@
 
 #include "obe/book/book_manager.hpp"
 
-// The registry of named implementations, and the optional prefetch hook. None
-// of this depends on the hand-written containers being finished.
+// The registry of named implementations, and the optional prefetch hook.
 
 namespace {
 

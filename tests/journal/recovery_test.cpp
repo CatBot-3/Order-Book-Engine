@@ -28,7 +28,7 @@
 // journal was replayed, and by what they say to every request afterwards.
 //
 // Replay needs nothing from an engine beyond the ordinary contract, so this
-// suite is typed over the engines and runs on the hand-written one too.
+// suite is typed over the engines and runs on the pooled engine too.
 
 namespace {
 

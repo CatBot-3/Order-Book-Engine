@@ -39,7 +39,7 @@
 //   tests/net/transport_test.cpp   the contract, over real loopback sockets
 //   tests/net/gateway_test.cpp     the whole gateway on top of it
 //
-//   ctest --preset debug -L hand-written -R 'Transport|Gateway|quarantine'
+//   ctest --preset debug -L core -R 'Transport|Gateway|quarantine'
 //
 // The third name is the same tests once more with AddressSanitizer told to
 // hand freed memory straight back (tests/CMakeLists.txt says why): the run in

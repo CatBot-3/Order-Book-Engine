@@ -14,7 +14,7 @@
 #include "support/engine_harness.hpp"
 #include "support/flow_run.hpp"
 
-// The differential test for the hand-written engine.
+// The differential test for the pooled engine.
 //
 // MatchingEngine and ReferenceEngine are given the same seeded flow. They must
 // say exactly the same things: the same market data, byte for byte, and the

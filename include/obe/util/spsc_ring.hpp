@@ -26,7 +26,7 @@
 //
 // and the two that criterion 6 names:
 //
-//   ctest --preset tsan -L hand-written          # ThreadSanitizer must be silent
+//   ctest --preset tsan -L core                  # ThreadSanitizer must be silent
 //   scripts/queue_stress.sh build/release/bench/queue_bench ring   # one billion, in order
 //
 // The baseline it is measured against is MutexQueue (mutex_queue.hpp):

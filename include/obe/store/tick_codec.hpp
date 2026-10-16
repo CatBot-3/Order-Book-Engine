@@ -47,7 +47,7 @@
 //   RawCodec     (this file) every field at full width, 34 bytes a tick. The
 //                reference: obviously right, and the size everything else is
 //                measured against.
-//   DeltaCodec   (delta_codec.hpp) the compressing one. Written by hand.
+//   DeltaCodec   (delta_codec.hpp) the compressing one.
 
 namespace obe::store {
 

@@ -30,7 +30,7 @@ scripts/run_bench.sh $F baseline --reserve <peak resting orders>
 # 2. Write the hypothesis in this file. Then write the code.
 
 # 3. Correct first: the tests, then the full day against the reference.
-ctest --preset debug -L hand-written
+ctest --preset debug -L core
 scripts/diff_books.sh --replay $B/apps/book_replay --file $F --impl flat-store
 
 # 4. After.

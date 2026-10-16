@@ -23,7 +23,7 @@
 //
 // Exit status: 0 success, 1 usage or I/O error, 2 the store is damaged or is
 // not a store, or the ITCH file is corrupt, 3 the store does not match the
-// feed, 4 the chosen codec is not written yet.
+// feed.
 
 #include <algorithm>
 #include <array>
@@ -58,7 +58,6 @@
 #include "obe/types.hpp"
 #include "obe/util/format.hpp"
 #include "obe/util/mapped_file.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -177,12 +176,6 @@ struct CloseFile {
 template <class Codec>
 int record(const Options& opt) {
     const util::MappedFile in = map_feed(opt.paths[0]);
-    {
-        // A codec that is not written yet says so here, before a file with
-        // nothing but a header is left behind under the store's name.
-        Codec probe;
-        probe.reset();
-    }
     std::unique_ptr<std::FILE, CloseFile> out(std::fopen(opt.paths[1].c_str(), "wb"));
     if (!out) {
         throw std::runtime_error("cannot create '" + opt.paths[1] + "': " + std::strerror(errno));
@@ -646,9 +639,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

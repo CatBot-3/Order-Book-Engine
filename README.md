@@ -3,9 +3,10 @@
 A C++20 market-data system built on real Nasdaq exchange data. It reads
 Nasdaq's TotalView-ITCH 5.0 binary feed and rebuilds the displayed order book
 of every listed stock, with a correctness check on every book and a
-reproducible latency harness around the whole thing. It is growing into a small
-exchange: a price-time-priority matching engine, a lock-free hand-off between
-threads, a TCP order gateway and a UDP market-data feed. A market-making
+reproducible latency harness around the whole thing. Around the book sits a
+small exchange: a price-time-priority matching engine, a lock-free hand-off
+between threads, a TCP order gateway on epoll or io_uring, and a UDP
+market-data feed. A market-making
 simulator replays the feed and asks what would have happened to quotes placed
 in it. The engine can keep a journal of its requests and come back from being
 killed holding exactly what it held.
@@ -14,26 +15,27 @@ The rule of the project: prove the book is right, measure before optimizing,
 and log every experiment with a before and an after, including the ones that
 did not help.
 
-## Status
+## What is built
 
-| Phase | What | State |
-|---|---|---|
-| 0 | Build, CI, lint, data fetch | done |
-| 1 | ITCH 5.0 parser, `itch_stats`, fuzzing | done; on the real day of 30 January 2019 its counts match the independent counter for all 368,366,634 messages |
-| 2 | Reference order book | done; the whole real day replays with every invariant counter at zero |
-| 3 | Measurement harness | done; baseline recorded on the real day (in a cloud VM, see Results) |
-| 4 | Optimization log | done: the pool, the flat order store, the vector price levels; thirteen entries from the real day, accepted, rejected and inconclusive, every optimized book equal to the reference |
-| 5 | Matching engine and flow generator | done: reference engine, pooled engine (intrusive queues, orders from a pool, chunked id index), flow generator, round trip |
-| 6 | Lock-free queue and threaded pipeline | done: mutex queue, lock-free ring, seqlock, three-thread pipeline, benchmarks; one billion items through the ring in order, ThreadSanitizer silent |
-| 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; first latency curve taken (in a cloud VM: indicative) |
-| 8 | Market-making simulator | done: fill model, metrics, three strategies including Avellaneda-Stoikov, `mm_sim`; run on AAPL for the real day |
-| 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; first costs measured |
-| 10 | Self-match prevention and more order types (stretch idea 2) | done in both engines: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot |
-| 11 | Compressed tick store (stretch idea 3) | done: the file format, queries by time, recovery of an unfinished store, the compressing codec, `tick_store`, `tick_bench`; the real day stored at 7.30 bytes a tick against 34 raw, both stores verified against the book |
-| 12 | io_uring gateway against epoll (stretch idea 4) | done: the gateway runs on either transport; the epoll transport, the io_uring rings (raw system calls) and the io_uring transport, `transport_bench`, `exchange_server --io`; system calls per request measured (io_uring 0.04 against epoll's 2.12 at 256 connections) |
+| Part | State |
+|---|---|
+| Build, CI, lint, data fetch | done |
+| ITCH 5.0 parser, `itch_stats`, fuzzing | done; on the real day of 30 January 2019 its counts match the independent counter for all 368,366,634 messages |
+| Reference order book | done; the whole real day replays with every invariant counter at zero |
+| Measurement harness | done; baseline recorded on the real day (in a cloud VM, see Results) |
+| Optimization log | done: the pool, the flat order store, the vector price levels; thirteen entries from the first real-data run, accepted, rejected and inconclusive, every optimized book equal to the reference |
+| Matching engine and flow generator | done: reference engine, pooled engine (intrusive queues, orders from a pool, chunked id index), flow generator, round trip |
+| Lock-free queue and threaded pipeline | done: mutex queue, lock-free ring, seqlock, three-thread pipeline, benchmarks; one billion items through the ring in order, ThreadSanitizer silent |
+| TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; first latency curve taken (in a cloud VM: indicative) |
+| Market-making simulator | done: fill model, metrics, three strategies including Avellaneda-Stoikov, `mm_sim`; run on AAPL for the real day |
+| Journal, snapshot and crash recovery | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; first costs measured |
+| Self-match prevention and more order types | done in both engines: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot |
+| Compressed tick store | done: the file format, queries by time, recovery of an unfinished store, the compressing codec, `tick_store`, `tick_bench`; the real day stored at 7.30 bytes a tick against 34 raw, both stores verified against the book |
+| io_uring gateway against epoll | done: the gateway runs on either transport; the epoll transport, the io_uring rings (raw system calls) and the io_uring transport, `transport_bench`, `exchange_server --io`; system calls per request measured (io_uring 0.04 against epoll's 2.12 at 256 connections) |
 
-No performance number appears in this README until it has been measured on
-real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
+Every number in this README comes from a measured run, with the method in
+[`docs/benchmark-method.md`](docs/benchmark-method.md) and the machine it ran on
+stated beside it.
 
 ## Architecture
 
@@ -69,13 +71,13 @@ real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.
 |---|---|
 | `include/obe/feed/` | message structs, codec, `ItchParser<Handler>`, framing |
 | `include/obe/book/` | `BookManager`, `Book`, the reference and optimized containers, concepts, the named implementations, hash listener |
-| `include/obe/engine/` | the matching-engine contract, `ReferenceEngine`, the hand-written `MatchingEngine`, `ItchFeedWriter`, the round-trip comparison |
+| `include/obe/engine/` | the matching-engine contract, `ReferenceEngine`, the pooled `MatchingEngine`, `ItchFeedWriter`, the round-trip comparison |
 | `include/obe/pipeline/` | the replay as three threads joined by queues; the top-of-book board |
-| `include/obe/net/` | the order-entry protocol, `OrderGateway` over a transport, the epoll transport, the io_uring rings and the hand-written io_uring transport, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
-| `include/obe/sim/` | the market-making simulator: fill model, the simple strategies, the hand-written Avellaneda-Stoikov strategy, volatility estimate, report |
+| `include/obe/net/` | the order-entry protocol, `OrderGateway` over a transport, the epoll transport, the io_uring rings and the io_uring transport, MoldUDP64-style packetizer and gap-detecting receiver, UDP sockets, the load generator's fixed schedule |
+| `include/obe/sim/` | the market-making simulator: fill model, the simple strategies, the Avellaneda-Stoikov strategy, volatility estimate, report |
 | `include/obe/journal/` | the write-ahead journal: records, writer, a reader that tells a torn tail from damage, replay, snapshots, the file layer, recovery from files |
-| `include/obe/store/` | the tick store: the codec contract and the reference codec, the hand-written compressing codec, the block file with its index, writer, recorder and reader, the tick profile |
-| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the hand-written `SpscRing`, `SpinChannel`, `Seqlock`; CRC-32, varints |
+| `include/obe/store/` | the tick store: the codec contract and the reference codec, the compressing codec, the block file with its index, writer, recorder and reader, the tick profile |
+| `include/obe/util/` | `LatencyHistogram`, clocks, CPU pinning, perf counters, `MappedFile`, pool and pool allocator, huge-page buffer; `MutexQueue`, the lock-free `SpscRing`, `SpinChannel`, `Seqlock`; CRC-32, varints |
 | `include/obe/gen/` | seeded generators: order flow for the engine, a raw ITCH stream for fixtures, and ticks for the store |
 | `apps/` | `itch_stats`, `book_replay`, `book_view`, `feed_profile`, `flow_gen`, `itch_synth`; `exchange_server`, `load_gen`, `md_listen`; `mm_sim`; `engine_journal`; `tick_store` |
 | `bench/` | `replay_bench` (full replay), `engine_bench` (matching engine), `queue_bench` (queues, and the ordered stress run), `pipeline_bench` (three threads against one), `journal_bench` (journaling and recovery), `tick_bench` (tick codecs and block sizes), `transport_bench` (system calls per request, by transport), `micro_bench` (Google Benchmark) |
@@ -96,7 +98,7 @@ Google Benchmark are fetched by CMake.
 cmake --preset debug                         # Debug with AddressSanitizer and UBSan
 cmake --build --preset debug
 ctest --preset debug                         # everything
-ctest --preset debug -L hand-written         # only the eight hand-written parts
+ctest --preset debug -L core                 # only the eight core parts (docs/design.md, section 6)
 ```
 
 Other presets: `release` (the only one whose timings mean anything), `tsan`,
@@ -109,6 +111,8 @@ mkdir -p fuzz/corpus
 build/fuzz/fuzz/parser_fuzz -max_len=4096 -max_total_time=60 fuzz/corpus fuzz/seeds
 mkdir -p fuzz/journal_corpus
 build/fuzz/fuzz/journal_fuzz -max_len=2048 -max_total_time=60 fuzz/journal_corpus fuzz/journal_seeds
+mkdir -p fuzz/tick_corpus
+build/fuzz/fuzz/tick_store_fuzz -max_len=2048 -max_total_time=60 fuzz/tick_corpus fuzz/tick_seeds
 ```
 
 ## Data
@@ -205,7 +209,7 @@ F=data/01302019.NASDAQ_ITCH50
    scripts/flow_round_trip.sh $B/apps/flow_gen $B/apps/book_replay
    ```
 
-6. **The hand-written engine equals the reference engine.** Same requests,
+6. **The pooled engine equals the reference engine.** Same requests,
    same market data byte for byte, same reports to owners.
 
    ```sh
@@ -372,23 +376,25 @@ as this machine's; the same run on a desktop gets its own columns.
 All books replay the whole day, 368,366,634 messages; latencies in ns per
 message, medians over the runs.
 
-| Build | Messages/s | p50 | p99 | p99.9 | max | Cache misses per message |
-|---|---|---|---|---|---|---|
-| Reference (`std::map`, `std::unordered_map`) | 2,361,505 | 426 | 1,645 | 14,141 | 177.5 ms | n/a |
-| + flat order table | 2,668,257 | 342 | 1,493 | 14,141 | 92.7 ms | n/a |
-| + contiguous price levels | 4,712,324 | 232 | 746 | 5,485 | 81.4 ms | n/a |
-| + table pre-sized for the day's peak | 4,780,096 | 224 | 731 | 5,363 | 38.5 ms | n/a |
-| + prefetch of the next message's order: final | 6,104,579 | 163 | 609 | 2,560 | 28.6 ms | n/a |
-| Contiguous price levels alone | 3,399,704 | 281 | 1,127 | 10,727 | 164.9 ms | n/a |
-| Reference containers with a pool allocator | 2,473,392 | 426 | 1,615 | 14,141 | 199.9 ms | n/a |
-| Pre-sized combined book, link-time optimized | 4,912,284 | 228 | 731 | 5,120 | 40.2 ms | n/a |
-| Pre-sized combined book, profile-guided (trained on this day) | 5,494,735 | 224 | 731 | 5,607 | 87.0 ms | n/a |
+| Build | Messages/s | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| Reference (`std::map`, `std::unordered_map`) | 2,361,505 | 426 | 1,645 | 14,141 | 177.5 ms |
+| + flat order table | 2,668,257 | 342 | 1,493 | 14,141 | 92.7 ms |
+| + contiguous price levels | 4,712,324 | 232 | 746 | 5,485 | 81.4 ms |
+| + table pre-sized for the day's peak | 4,780,096 | 224 | 731 | 5,363 | 38.5 ms |
+| + prefetch of the next message's order: final | 6,104,579 | 163 | 609 | 2,560 | 28.6 ms |
+| Contiguous price levels alone | 3,399,704 | 281 | 1,127 | 10,727 | 164.9 ms |
+| Reference containers with a pool allocator | 2,473,392 | 426 | 1,615 | 14,141 | 199.9 ms |
+| Pre-sized combined book without the prefetch, link-time optimized | 4,912,284 | 228 | 731 | 5,120 | 40.2 ms |
+| Pre-sized combined book without the prefetch, profile-guided (trained on this day) | 5,494,735 | 224 | 731 | 5,607 | 87.0 ms |
 
 Final against reference: 2.59x the throughput, the median message 2.6 times
 cheaper, p99.9 5.5 times lower. Every optimized row published exactly the
-reference's best-bid-and-offer stream (hash `73b11ec0681d1994`), and
-`scripts/diff_books.sh` matched all 8,695 securities. No cache-miss column:
-this machine exposes no hardware counters.
+reference's best-bid-and-offer stream (hash `73b11ec0681d1994`, which
+`replay_bench` checks itself), and `scripts/diff_books.sh` compared each of the
+four optimized implementations with the reference security by security: all
+8,695 identical. No cache-miss figures: this machine exposes no hardware
+counters.
 
 Every experiment, accepted or rejected, is in
 [`docs/optimization-log.md`](docs/optimization-log.md), with the feed profile
@@ -422,10 +428,7 @@ The same curve for the reference engine and for io_uring, and
 io_uring 2.00 falling to 0.04, from 1 to 256 busy connections), are in entry
 12 of the optimization log.
 
-Filled by `scripts/latency_curve.py` from a real run. In this one the
-exchange and the subscriber ran on CPU 1 and the load generator on CPU 0;
-`real_data_evals.sh` now writes that into `gateway/pinning.txt` with the
-results.
+The exchange and the subscriber ran on CPU 1 and the load generator on CPU 0.
 
 ### The rest of the day's run
 
@@ -434,10 +437,11 @@ the details).
 
 | What | Result |
 |---|---|
-| Matching engines (`engine_bench`, 2,000,000 synthetic requests) | pooled 12,581,950 requests/s against the reference's 6,062,610 (2.08x), output identical |
-| Lock-free ring (`queue_bench`, two CPUs) | 74,891,081 items/s against 4,412,509 for the mutex queue; the billion-item run in order |
+| Matching engines (`engine_bench`, 2,000,000 synthetic requests) | pooled 12,581,950 requests/s against the reference's 6,062,610 (2.08x), output identical. Throughput varied by up to 40% between runs on this VM, but the ranges do not overlap (pooled 9.7 to 14.7 million, reference 4.3 to 6.5 million); median request 102 against 182 ns |
+| Lock-free ring (`queue_bench`, two CPUs) | 74,891,081 items/s against 4,412,509 for the mutex queue (the ring's runs varied by 50%: an order of magnitude, not a figure); the billion-item run arrived complete and in order |
+| Three threads against one (`pipeline_bench`, the day) | 0.97x one thread with the ring, 0.31x with the mutex queue, same output both ways. Three threads on two CPUs cannot win: this needs a machine with three free cores |
 | Tick store, whole day, 4,096 ticks a block | 174,890,436 ticks: 7.30 bytes a tick against 34.02 raw, 8.78 through `zstd -3` and 6.88 through `zstd -19` (27 minutes); both stores verified against the book |
-| Journal (`journal_bench` on this VM's disk) | 4,699,037 requests/s without, 3,670,706 with one write per 4,096 requests; one `fdatasync` 143 µs alone, 880 µs after 4,096 records; the crash test passes |
+| Journal (`journal_bench` on this VM's disk) | 4,699,037 requests/s without, 3,670,706 with one write per 4,096 requests; one `fdatasync` 143 µs alone, 880 µs after 4,096 records (runs varied by 10 to 50%); the crash test passes |
 
 `mm_sim` on AAPL, 09:30 to 16:00, 50 µs latency, 100 shares a quote: a
 simulation under stated assumptions, not an estimate of profit.
@@ -458,7 +462,7 @@ point 6 of `avellaneda_stoikov.hpp`). The inventory-aware quotes lost least.
 |---|---|
 | Unit | every decoder against bytes built at specification offsets; containers; histogram |
 | Golden | a hand-built byte stream with a hand-worked book |
-| Differential | the book against a naive oracle, update for update; each optimized book and the hand-written engine against their reference |
+| Differential | the book against a naive oracle, update for update; each optimized book and the pooled engine against their reference |
 | Property | long seeded random sequences against a `std::map` model; for the engine: never crossed, shares conserved, price-time order, determinism, on flows with and without icebergs, post-only orders and self-match prevention |
 | Round trip | the engine's published feed, through the feed handler, rebuilds the engine's book |
 | Concurrency | each queue: every item once, in order, intact, between two threads; the pipeline against the single-threaded replay; the seqlock against torn reads |
@@ -468,7 +472,7 @@ point 6 of `avellaneda_stoikov.hpp`). The inventory-aware quotes lost least.
 | Tick store | each codec gives back every tick, likely or not, and reads arbitrary bytes without leaving them; ranges of time against a filter over the plain list; a store that was never finished, cut at every byte, or changed one bit at a time never yields a tick that was not written; an index that checks out and lies is not believed; the real program against a fresh replay of the feed |
 | Fuzz | libFuzzer on the parser: no crash, and decode then encode reproduces the input. On the journal: any cut gives a prefix of the requests, and any changed byte is noticed and never applied. On the tick store: a file that opens describes itself consistently, and a store with one byte changed never yields a tick that was not written |
 | Sanitizers | AddressSanitizer and UBSan on all tests; ThreadSanitizer on all of them too, which is what checks the queues' memory ordering |
-| CI | all of the above on GCC and Clang, plus a formatting check |
+| CI | GitHub Actions: debug and release builds with every test on GCC 13 and Clang 18, the ThreadSanitizer build, a one-minute fuzzing run of the parser, a formatting check, and clang-tidy (advisory) |
 
 ## Limitations
 

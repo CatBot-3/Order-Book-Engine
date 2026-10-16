@@ -17,8 +17,7 @@
 // that print the same pair for the same options behaved identically;
 // scripts/diff_engines.sh makes that comparison.
 //
-// Exit status: 0 clean, 1 usage or I/O error, 2 the round trip failed,
-// 4 the chosen engine is not written yet.
+// Exit status: 0 clean, 1 usage or I/O error, 2 the round trip failed.
 
 #include <charconv>
 #include <cinttypes>
@@ -43,7 +42,6 @@
 #include "obe/feed/parser.hpp"
 #include "obe/gen/order_flow.hpp"
 #include "obe/util/format.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -309,9 +307,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

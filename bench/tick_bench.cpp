@@ -1,8 +1,7 @@
 // tick_bench: what a tick codec saves and what it costs.
 //
 //   tick_bench [options]
-//     --codec NAME       measure this codec only (default: every codec that
-//                        is written)
+//     --codec NAME       measure this codec only (default: every codec)
 //     --file FILE        take the ticks from an ITCH file, replayed through
 //                        the book (default: a generated market)
 //     --max-ticks N      with --file, keep the first N ticks (default 20000000)
@@ -43,8 +42,7 @@
 // docs/benchmark-method.md applies; read it before quoting a number.
 //
 // Exit status: 0 ok, 1 usage or I/O error, 2 the ITCH file is corrupt, 3 a
-// store did not give back the ticks it was given, 4 the chosen codec is not
-// written yet.
+// store did not give back the ticks it was given.
 
 #include <algorithm>
 #include <charconv>
@@ -75,7 +73,6 @@
 #include "obe/util/format.hpp"
 #include "obe/util/huge_pages.hpp"
 #include "obe/util/mapped_file.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -84,7 +81,7 @@ using store::Tick;
 using Clock = std::chrono::steady_clock;
 
 struct Options {
-    std::string codec;  // empty: every codec that is written
+    std::string codec;  // empty: every codec
     std::string file;
     std::string json_path;
     std::string label;
@@ -154,7 +151,6 @@ struct Report {
     Nanos earliest = 0;
     Nanos latest = 0;
     std::vector<Row> rows;
-    std::vector<std::string> not_written;
     std::vector<std::string> warnings;
 };
 
@@ -244,18 +240,6 @@ Row measure(const Options& opt, const std::vector<Tick>& ticks, std::uint32_t bl
     return row;
 }
 
-// Whether the codec's functions exist yet.
-template <class Codec>
-bool written() {
-    try {
-        Codec codec;
-        codec.reset();
-        return true;
-    } catch (const util::Unimplemented&) {
-        return false;
-    }
-}
-
 bench::Summary summary(const std::vector<double>& runs) {
     return bench::summarize(runs, [](double v) { return v; });
 }
@@ -287,9 +271,6 @@ void print_text(const Report& r) {
         "\n  A query covers a thousandth of the time the store spans. It decodes every\n"
         "  block that range touches, whole: blocks/q times the block size is what it\n"
         "  read to hand over ticks/q.\n");
-    for (const std::string& name : r.not_written) {
-        std::printf("\n  codec '%s' is not written yet and was left out\n", name.c_str());
-    }
     for (const std::string& w : r.warnings) {
         std::printf("\nWARNING: %s\n", w.c_str());
     }
@@ -328,12 +309,7 @@ bool write_json(const Report& r) {
                      d.max, q.median, row.blocks_per_query, row.ticks_per_query,
                      row.ok ? "true" : "false", i + 1 < r.rows.size() ? "," : "");
     }
-    std::fprintf(f, "  ],\n  \"not_written\": [");
-    for (std::size_t i = 0; i < r.not_written.size(); ++i) {
-        std::fprintf(f, "%s\"%s\"", i == 0 ? "" : ", ",
-                     bench::json_escape(r.not_written[i]).c_str());
-    }
-    std::fprintf(f, "],\n  \"warnings\": [");
+    std::fprintf(f, "  ],\n  \"warnings\": [");
     for (std::size_t i = 0; i < r.warnings.size(); ++i) {
         std::fprintf(f, "%s\"%s\"", i == 0 ? "" : ", ", bench::json_escape(r.warnings[i]).c_str());
     }
@@ -483,10 +459,6 @@ int run(int argc, char** argv) {
         if (!opt.codec.empty() && opt.codec != Codec::kName) {
             return;
         }
-        if (!written<Codec>()) {
-            report.not_written.emplace_back(Codec::kName);
-            return;
-        }
         for (const std::uint32_t block : {256U, 4'096U, 65'536U}) {
             Row row = measure<Codec>(opt, ticks, block, expected, earliest, latest);
             ok = ok && row.ok;
@@ -503,14 +475,6 @@ int run(int argc, char** argv) {
     });
     report.huge_bytes = util::process_huge_bytes();
 
-    if (report.rows.empty()) {
-        // The one codec that was asked for is the one that is not written.
-        store::with_codec(opt.codec, []<class Codec>(std::type_identity<Codec>) {
-            Codec codec;
-            codec.reset();  // throws Unimplemented, with the name of what is missing
-        });
-        return 4;
-    }
     print_text(report);
     if (!opt.json_path.empty() && !write_json(report)) {
         std::fprintf(stderr, "error: cannot write '%s'\n", opt.json_path.c_str());
@@ -528,9 +492,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

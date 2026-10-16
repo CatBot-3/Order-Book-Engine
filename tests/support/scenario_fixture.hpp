@@ -23,8 +23,7 @@
 // that is the reference engine and the test oracle (support/naive_engine.hpp):
 // the property tests use the oracle to judge the reference on random flow,
 // which is only worth something if the oracle itself agrees with the
-// hand-worked cases. In the hand-written build it is the hand-written
-// engine.
+// hand-worked cases. In the core build it is the pooled engine.
 
 namespace obe::test::scenario {
 
@@ -153,7 +152,7 @@ class ScenarioFixture : public ::testing::Test {
     Nanos now = 0;
     engine::Token token = 100;
 };
-#if defined(OBE_TEST_HAND_WRITTEN)
+#if defined(OBE_TEST_CORE)
 using ScenarioEngines = test::EngineTypes;
 #else
 using ScenarioEngines = ::testing::Types<engine::ReferenceEngineImpl, test::NaiveEngineImpl>;

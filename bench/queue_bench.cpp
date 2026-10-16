@@ -33,7 +33,7 @@
 // answers. Pin them with --cpus and say which CPUs they were.
 //
 // Exit status: 0 ok, 1 usage error, 3 an item arrived out of order (the
-// timings are void), 4 the chosen queue is not written yet.
+// timings are void).
 
 #include <array>
 #include <atomic>
@@ -57,7 +57,6 @@
 #include "obe/util/format.hpp"
 #include "obe/util/huge_pages.hpp"
 #include "obe/util/queue_concepts.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -465,9 +464,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

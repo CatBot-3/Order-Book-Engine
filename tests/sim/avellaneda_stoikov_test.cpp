@@ -11,7 +11,7 @@
 #include "obe/types.hpp"
 #include "support/sim_harness.hpp"
 
-// The Avellaneda-Stoikov strategy: the part of the simulator written by hand.
+// The Avellaneda-Stoikov strategy.
 //
 // The expected prices were worked out from the contract in
 // obe/sim/avellaneda_stoikov.hpp with a calculator, not with the code under

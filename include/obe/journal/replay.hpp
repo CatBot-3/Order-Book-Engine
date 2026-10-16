@@ -28,7 +28,7 @@
 //
 // Replay goes through the engine's ordinary operations, so it needs nothing
 // from the engine but the contract in obe/engine/concepts.hpp. Any engine can
-// be recovered this way, the hand-written one included.
+// be recovered this way, the pooled engine included.
 //
 // The engine's output during a replay is the output it produced the first
 // time. Whoever recovers decides what to do with it: usually nothing (give

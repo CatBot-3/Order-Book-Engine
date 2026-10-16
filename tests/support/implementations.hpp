@@ -10,17 +10,16 @@
 // container is judged by exactly the tests the reference has to pass. The same
 // test sources are built twice:
 //
-//   obe_book_tests           the reference containers.
-//   obe_hand_written_tests   built with OBE_TEST_HAND_WRITTEN defined: the
-//                            optimized containers of phase 4. Labelled
-//                            hand-written.
+//   obe_book_tests   the reference containers.
+//   obe_core_tests   built with OBE_TEST_CORE defined: the optimized
+//                    containers of phase 4. Labelled core.
 //
 // To put a new container under test, add it to the lists below (and, to make
 // it selectable with --impl, to obe/book/implementations.hpp).
 
 namespace obe::test {
 
-#if defined(OBE_TEST_HAND_WRITTEN)
+#if defined(OBE_TEST_CORE)
 
 using OrderStoreTypes = ::testing::Types<book::FlatOrderStore, book::PooledOrderStore>;
 

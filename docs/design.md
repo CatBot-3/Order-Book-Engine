@@ -277,7 +277,7 @@ this paragraph.
 | Engine scenario | `tests/engine/engine_scenario_test.cpp`, `instructions_test.cpp` | every order type, every instruction and every edge of the engine contract: reports, market data and the book left behind |
 | Engine property | `tests/engine/engine_property_test.cpp` | never crossed, shares conserved, price-time order, determinism, and agreement with an oracle, over seeded random flow |
 | Round trip | `tests/engine/round_trip_test.cpp`, `scripts/flow_round_trip.sh` | the engine's feed, through the feed handler, rebuilds the engine's book |
-| Engine differential | `tests/engine/engine_differential_test.cpp`, `scripts/diff_engines.sh` | the hand-written engine says exactly what the reference says |
+| Engine differential | `tests/engine/engine_differential_test.cpp`, `scripts/diff_engines.sh` | the pooled engine says exactly what the reference says |
 | Queue contract | `tests/util/queue_test.cpp`, `channel_test.cpp` | order, full and empty on one thread; every item once, in order and intact across two; close and cancel |
 | Pipeline | `tests/pipeline/pipeline_test.cpp` | three threads publish exactly what one thread publishes, on any queue, with any capacity, on bad input, and when a stage throws |
 | Seqlock | `tests/util/seqlock_test.cpp` | a reader never sees a value nobody stored |
@@ -290,7 +290,7 @@ this paragraph.
 | The three programs | `scripts/gateway_smoke.sh` | orders in over TCP, market data out over UDP, the subscriber's book consistent and gap-free |
 | Simulator scenario | `tests/sim/sim_scenario_test.cpp` | each rule of the fill model on hand-built messages: who is ahead, the three ways a quote trades, refusals, halts, latency, every money figure |
 | Simulator property | `tests/sim/sim_property_test.cpp` | over generated markets, after every message: the queue ahead against the test's own copy of the orders, the money recounted from the fills, the book against a plain replay |
-| Strategies | `tests/sim/strategy_test.cpp`, `avellaneda_stoikov_test.cpp` | tick rounding, the simple strategies and the volatility estimate against figures worked out by hand; the hand-written strategy against its contract |
+| Strategies | `tests/sim/strategy_test.cpp`, `avellaneda_stoikov_test.cpp` | tick rounding, the simple strategies and the volatility estimate against figures worked out by hand; the Avellaneda-Stoikov strategy against its contract |
 | Journal format | `tests/journal/journal_format_test.cpp`, `fuzz/journal_fuzz.cpp` | record bytes built by hand; truncation at every byte, every single-bit error, and the line between a torn tail and corruption |
 | Recovery | `tests/journal/recovery_test.cpp` | an engine rebuilt from a journal holds, said and goes on to say exactly what the original did; stopping short anywhere gives the engine as it was then; group commit loses only the unfinished batch |
 | Snapshot | `tests/journal/snapshot_test.cpp` | restore then compare as above; each thing a snapshot could forget; damaged and implausible snapshots refused |
@@ -298,7 +298,7 @@ this paragraph.
 | Varint | `tests/util/varint_test.cpp` | every size boundary, truncation at every length, overlong and overflowing encodings refused |
 | Tick codec | `tests/store/tick_codec_test.cpp` | lossless for every tick, likely or not; nothing survives a reset; no read outside the buffer on arbitrary or damaged bytes |
 | Tick store | `tests/store/tick_file_test.cpp`, `fuzz/tick_store_fuzz.cpp`, `scripts/tick_store_smoke.sh` | ranges of time against a filter over the plain list; a store never finished, cut at every byte, with every single-bit error, with an index that lies; the real program against a replay of the feed |
-| Compression | `tests/store/compression_test.cpp` | the hand-written codec's size on generated ticks, against a first target |
+| Compression | `tests/store/compression_test.cpp` | the compressing codec's size on generated ticks, against a first target |
 
 `NaiveBook` (`tests/support/naive_book.hpp`) is the oracle: a flat map of
 orders that recomputes the best bid and offer by scanning every order after
@@ -312,43 +312,42 @@ All of this runs under AddressSanitizer and UndefinedBehaviorSanitizer in the
 `debug` preset, and the `tsan` preset runs it under ThreadSanitizer, which is
 the check that matters for the queues and the seqlock (section 9.6).
 
-## 6. Written by hand
+## 6. The core parts
 
-The project spec keeps the core data structures hand-written: no library
-container stands in for them. Each has a simple reference version beside it,
+Eight parts carry the performance and the interesting decisions, and no
+library container stands in for them. Each has a simple reference version beside it,
 written first, and is judged by the same tests the reference passes plus a
 differential check against it.
 
-| Component | File | Status |
+| Component | File | Role |
 |---|---|---|
-| Reference order store | `include/obe/book/order_store.hpp` | written |
-| Reference price levels | `include/obe/book/price_levels.hpp` | written |
-| Flat order table (experiment 1) | `include/obe/book/flat_order_store.hpp` | written by hand |
-| Contiguous price levels (experiment 3) | `include/obe/book/vector_price_levels.hpp` | written by hand |
-| Pool (experiment 4, and the engine's orders) | `include/obe/util/pool.hpp` | written by hand |
-| Reference matching engine | `include/obe/engine/reference_engine.hpp` | written |
-| Matching engine (pooled, intrusive queues), including the instructions of section 8.6 and snapshots | `include/obe/engine/matching_engine.hpp` | written by hand |
-| Mutex queue, spin channel, seqlock, pipeline | `include/obe/util/mutex_queue.hpp`, `spin_channel.hpp`, `seqlock.hpp`, `include/obe/pipeline/` | written |
-| Lock-free ring | `include/obe/util/spsc_ring.hpp` | written by hand |
-| Gateway, market-data publisher and receiver, load generator | `include/obe/net/`, `apps/` | written |
-| Market-making simulator, fill model, simple strategies, volatility estimate | `include/obe/sim/` | written |
-| Avellaneda-Stoikov strategy | `include/obe/sim/avellaneda_stoikov.hpp` | written by hand |
-| Journal, replay, snapshot, recovery from files | `include/obe/journal/` | written |
-| Tick store: varints, the file, the reference codec, the profile | `include/obe/util/varint.hpp`, `include/obe/store/` | written |
-| Compressing tick codec | `include/obe/store/delta_codec.hpp` | written by hand |
-| Gateway session logic, the transport contract, the epoll transport and its output buffer, the io_uring rings | `include/obe/net/order_gateway.hpp`, `transport.hpp`, `epoll_transport.hpp`, `out_buffer.hpp`, `uring.hpp` | written |
-| io_uring transport | `include/obe/net/uring_transport.hpp` | written by hand |
+| Reference order store | `include/obe/book/order_store.hpp` | reference |
+| Reference price levels | `include/obe/book/price_levels.hpp` | reference |
+| Flat order table (experiment 1) | `include/obe/book/flat_order_store.hpp` | core part |
+| Contiguous price levels (experiment 3) | `include/obe/book/vector_price_levels.hpp` | core part |
+| Pool (experiment 4, and the engine's orders) | `include/obe/util/pool.hpp` | core part |
+| Reference matching engine | `include/obe/engine/reference_engine.hpp` | reference |
+| Matching engine (pooled, intrusive queues), including the instructions of section 8.6 and snapshots | `include/obe/engine/matching_engine.hpp` | core part |
+| Mutex queue, spin channel, seqlock, pipeline | `include/obe/util/mutex_queue.hpp`, `spin_channel.hpp`, `seqlock.hpp`, `include/obe/pipeline/` | supporting |
+| Lock-free ring | `include/obe/util/spsc_ring.hpp` | core part |
+| Gateway, market-data publisher and receiver, load generator | `include/obe/net/`, `apps/` | supporting |
+| Market-making simulator, fill model, simple strategies, volatility estimate | `include/obe/sim/` | supporting |
+| Avellaneda-Stoikov strategy | `include/obe/sim/avellaneda_stoikov.hpp` | core part |
+| Journal, replay, snapshot, recovery from files | `include/obe/journal/` | supporting |
+| Tick store: varints, the file, the reference codec, the profile | `include/obe/util/varint.hpp`, `include/obe/store/` | supporting |
+| Compressing tick codec | `include/obe/store/delta_codec.hpp` | core part |
+| Gateway session logic, the transport contract, the epoll transport and its output buffer, the io_uring rings | `include/obe/net/order_gateway.hpp`, `transport.hpp`, `epoll_transport.hpp`, `out_buffer.hpp`, `uring.hpp` | supporting |
+| io_uring transport | `include/obe/net/uring_transport.hpp` | core part |
 
-Each hand-written header holds its contract and, under DESIGN, the decision
+Each core header holds its contract and, under DESIGN, the decision
 taken on every question the part raises and the reason for it. Sections 6.3 to
 6.10 summarise them. Their tests are built into second executables
-(`obe_hand_written_tests` for the containers and the pool,
-`obe_hand_written_engine_tests` and `obe_hand_written_journal_tests` for the
-engine, `obe_hand_written_concurrency_tests` for the ring,
-`obe_hand_written_sim_tests`, `obe_hand_written_store_tests` and
-`obe_hand_written_net_tests`) from the same sources as the reference tests.
-They carry the `ctest` label `hand-written` and, in `ctest`'s own listing, the
-prefix `hand_written.` on their names. The prefix is not decoration. A test
+(`obe_core_tests` for the containers and the pool,
+`obe_core_engine_tests` and `obe_core_journal_tests` for the engine,
+`obe_core_concurrency_tests` for the ring, `obe_core_sim_tests`,
+`obe_core_store_tests` and `obe_core_net_tests`) from the same sources as the reference tests.
+They carry the `ctest` label `core` and, in `ctest`'s own listing, the
+prefix `core.` on their names. The prefix is not decoration. A test
 that does not depend on the implementation has the same name in both
 executables, `ctest` keeps labels by name, and of two tests with one name the
 first ended up carrying the label of the second: a handful of tests were
@@ -356,8 +355,8 @@ counted under the wrong label until the names were made distinct.
 
 ```sh
 ctest --preset debug                         # everything
-ctest --preset debug -L hand-written         # only the hand-written parts
-ctest --preset tsan -L hand-written          # the ring's judge
+ctest --preset debug -L core                 # only the core parts
+ctest --preset tsan -L core                  # the ring's judge
 ```
 
 ### 6.1 Reference order store
@@ -505,7 +504,7 @@ list.
 
 **One test suite, built twice.** `tests/support/implementations.hpp` switches
 the typed-test lists on a compile definition. The reference build is part of
-the passing suite. The hand-written build runs the same contract, scenario and
+the passing suite. The core build runs the same contract, scenario and
 golden tests against the optimized containers, plus
 `tests/book/differential_test.cpp`, which replays generated streams of four
 different shapes through an optimized book and the reference and requires
@@ -610,12 +609,12 @@ opened.
 | Name | File | Structure |
 |---|---|---|
 | `reference` | `reference_engine.hpp` | `std::map` of levels, a `std::list` of orders per level, `std::unordered_map` from id to a list iterator |
-| `pooled` | `matching_engine.hpp` | intrusive queues of orders from `util::Pool`; **written by hand** |
+| `pooled` | `matching_engine.hpp` | intrusive queues of orders from `util::Pool`; a core part (section 6.6) |
 
 `flow_gen --engine NAME` and `engine_bench --engine NAME` select one. The
 reference allocates up to three nodes for an order that rests (list, index,
 and a tree node if the price is new) and frees them when it leaves. That is
-the cost the hand-written engine is there to remove, and `engine_bench` is how
+the cost the pooled engine is there to remove, and `engine_bench` is how
 the difference is measured.
 
 `engine_bench` records the requests once, as a tape, by running the generator
@@ -648,7 +647,7 @@ tests look at it from several independent directions:
    replace, sweeps, replaces that trade, new slices of icebergs, and
    self-match prevention stopping orders on both sides. Without it the
    properties could pass on flow that never visits the hard cases.
-6. **The differential test** holds the hand-written engine to the reference's
+6. **The differential test** holds the pooled engine to the reference's
    output: market data byte for byte, reports one by one.
 
 ### 8.5 The order-flow generator (`include/obe/gen/order_flow.hpp`)
@@ -775,7 +774,7 @@ venue matches on a firm or group identifier, not on one owner id).
 `queue_concepts.hpp` separates two things that are usually tangled together.
 
 A **`BoundedQueue`** has `try_push` and `try_pop` and never waits. This is all a
-lock-free ring is, and keeping the contract that small keeps the hand-written
+lock-free ring is, and keeping the contract that small keeps the ring's
 structure small enough to reason about completely.
 
 A **`Channel`** can be waited on: `push` waits for room, `pop` waits for an
@@ -800,7 +799,7 @@ tests exactly this, two thousand times over.
 |---|---|---|
 | `mutex` | `std::mutex` | sleeps on a condition variable |
 | `mutex-spin` | `std::mutex` | spins |
-| `ring` | none (`SpscRing`, **written by hand**) | spins |
+| `ring` | none (`SpscRing`, a core part) | spins |
 
 The spec asks for the ring to be compared with a mutex queue. Comparing only
 those two would mix two differences: the lock, and the sleep. The middle row
@@ -1114,7 +1113,7 @@ of the gateway.
 | `epoll_transport.hpp` | `EpollTransport`, the reference: what the gateway used to do itself |
 | `out_buffer.hpp` | `OutBuffer`: one connection's unsent output for a readiness transport. It may move its bytes, which is exactly what a completion transport's queue may not do |
 | `uring.hpp` | `Uring`: the two rings and the three system calls of `io_uring`, with nothing in between |
-| `uring_transport.hpp` | `UringTransport`. **Written by hand** (section 6.10) |
+| `uring_transport.hpp` | `UringTransport`, a core part (section 6.10) |
 | `transports.hpp` | the transports by name, for `--io` |
 
 **Two models.** With readiness, the program asks which sockets could be read
@@ -1195,7 +1194,7 @@ id reused the moment its connection is closed; a connection closed with a
 backlog; and a transport destroyed with connections open and output queued.
 The whole gateway suite of section 10.5 then runs on the same transport.
 Both files are built twice: on `EpollTransport` in `obe_net_tests`, and on
-`UringTransport` in `obe_hand_written_net_tests`. `uring_test.cpp` covers the rings
+`UringTransport` in `obe_core_net_tests`. `uring_test.cpp` covers the rings
 themselves.
 
 Two things about these tests are there because of what they cannot do.
@@ -1212,9 +1211,9 @@ Two things about these tests are there because of what they cannot do.
    reads from it or writes to it. AddressSanitizer does not see what the
    kernel does, and worse, it keeps freed memory aside with its old contents
    for a while, so the kernel finds the right bytes in the wrong place and
-   everything passes. The hand-written transport's tests are therefore run a
+   everything passes. The io_uring transport's tests are therefore run a
    second time with that quarantine switched off
-   (`hand_written_net_tests_without_quarantine`), so that freed memory is
+   (`core_net_tests_without_quarantine`), so that freed memory is
    reused or unmapped at once and the mistake has a chance of showing as
    wrong bytes or a failed send. It remains a chance: the question has to be
    settled by reasoning about lifetimes, and the header says so.
@@ -1383,7 +1382,7 @@ Both stop adding to a position at a limit, and know nothing else about risk.
 
 **Avellaneda-Stoikov** (`avellaneda_stoikov.hpp`) is the textbook step up: it
 moves both quotes against the position and widens them with volatility and with
-the time left. It is written by hand (section 6.8); its header has the
+the time left. It is a core part (section 6.8); its header has the
 contract, what each term means, and where this simulator departs from the
 model, and its tests' expected prices are worked out by hand in the comments.
 
@@ -1466,7 +1465,7 @@ Two things follow.
 `Journaled` has the engine's own interface, so anything that drives an engine
 can drive a journaled one instead, and the engine underneath does not know.
 Replay goes through the engine's ordinary operations, so it needs nothing from
-an engine beyond the contract of section 8: the hand-written engine can be
+an engine beyond the contract of section 8: the pooled engine can be
 journaled and recovered as it is.
 
 ### 12.3 The file
@@ -1691,7 +1690,7 @@ ideas.
 |---|---|
 | `util/varint.hpp` | variable-length integers and zigzag, the two building blocks of a compact format |
 | `store/tick_codec.hpp` | what a tick is (`book::BboUpdate`), the contract of a codec, and `RawCodec`: every field at full width, 34 bytes a tick |
-| `store/delta_codec.hpp` | `DeltaCodec`, the compressing one. **Written by hand** (section 6.9) |
+| `store/delta_codec.hpp` | `DeltaCodec`, the compressing one, a core part (section 6.9) |
 | `store/tick_file.hpp` | the file: `TickWriter`, `TickRecorder` (a book listener), `TickReader` |
 | `store/tick_profile.hpp` | `TickProfile`: what consecutive ticks differ by, measured |
 | `store/codecs.hpp` | the codecs by name and by the number a file carries |
@@ -1875,7 +1874,7 @@ hides length.
 A compressing codec is a bet on what its input looks like. `tick_store
 profile` measures the things such a bet is about, on a real file: the gaps
 between timestamps, how soon a security ticks again, which fields of a quote
-change together, and by how much. The hand-written codec is meant to be
+change together, and by how much. The compressing codec is
 designed from that table (section 6.9).
 
 The tests and the benchmark need ticks without a file, and
@@ -1922,7 +1921,7 @@ record` on a real file, and has not been taken.
    one block changed.
 
 The typed suites run on `RawCodec`, and on `DeltaCodec` in
-`obe_hand_written_store_tests`, where `compression_test.cpp` adds the size
+`obe_core_store_tests`, where `compression_test.cpp` adds the size
 target.
 
 What none of this measures is a real day: how many ticks one has, what the

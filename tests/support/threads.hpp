@@ -10,8 +10,8 @@
 // Two things go wrong when a test thread fails and nobody planned for it. An
 // exception that escapes a thread ends the whole process, taking every other
 // test's result with it. And the thread on the other end of a queue waits
-// for ever for an item that is not coming. A queue that is not written yet
-// does both at once, so these tests are built to fail cleanly:
+// for ever for an item that is not coming. A queue with a bug can do both at
+// once, so these tests are built to fail cleanly:
 //
 //   - Worker runs its body on a thread, catches whatever it throws, and
 //     rethrows it from join() on the test's own thread.

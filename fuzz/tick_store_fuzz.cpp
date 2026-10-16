@@ -25,8 +25,6 @@
 //      way the scan ended says so.
 //
 // Both codecs are run, and for DeltaCodec this fuzzer is the harshest judge.
-// (A codec whose functions throw util::Unimplemented is left out, which is
-// how the target ran while DeltaCodec was still a stub.)
 //
 //   cmake --preset fuzz && cmake --build --preset fuzz
 //   build/fuzz/fuzz/tick_store_fuzz -max_len=2048 -max_total_time=60 fuzz/tick_seeds
@@ -43,7 +41,6 @@
 #include "obe/store/tick_codec.hpp"
 #include "obe/store/tick_file.hpp"
 #include "obe/types.hpp"
-#include "obe/util/todo.hpp"
 #include "obe/util/varint.hpp"
 
 namespace {
@@ -301,18 +298,6 @@ void built_store(std::span<const std::byte> bytes) {
     }
 }
 
-// Runs f, unless it turns out to need the hand-written codec and that is not
-// there yet. Returns whether it ran to the end.
-template <class F>
-bool unless_unwritten(F&& f) {
-    try {
-        f();
-    } catch (const util::Unimplemented&) {
-        return false;
-    }
-    return true;
-}
-
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
@@ -327,11 +312,11 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     }
     if (data[0] % 2 == 0) {
         raw_store<store::RawCodec>(bytes);
-        static_cast<void>(unless_unwritten([&bytes] { raw_store<store::DeltaCodec>(bytes); }));
+        raw_store<store::DeltaCodec>(bytes);
         raw_varint(bytes);
     } else {
         built_store<store::RawCodec>(bytes);
-        static_cast<void>(unless_unwritten([&bytes] { built_store<store::DeltaCodec>(bytes); }));
+        built_store<store::DeltaCodec>(bytes);
     }
     return 0;
 }

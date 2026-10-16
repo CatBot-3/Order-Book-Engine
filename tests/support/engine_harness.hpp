@@ -22,9 +22,9 @@
 // Every suite in tests/engine is a typed test over EngineTypes and is built
 // twice, like the book suites:
 //
-//   obe_engine_tests                the reference engine.
-//   obe_hand_written_engine_tests   built with OBE_TEST_HAND_WRITTEN defined:
-//                                   MatchingEngine. Labelled hand-written.
+//   obe_engine_tests        the reference engine.
+//   obe_core_engine_tests   built with OBE_TEST_CORE defined: the pooled
+//                           engine (MatchingEngine). Labelled core.
 
 namespace obe::engine {
 
@@ -170,7 +170,7 @@ inline void PrintTo(const TradingAction& m, std::ostream* os) {
 
 namespace obe::test {
 
-#if defined(OBE_TEST_HAND_WRITTEN)
+#if defined(OBE_TEST_CORE)
 using EngineTypes = ::testing::Types<engine::PooledEngineImpl>;
 #else
 using EngineTypes = ::testing::Types<engine::ReferenceEngineImpl>;

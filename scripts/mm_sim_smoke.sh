@@ -4,22 +4,22 @@
 # numbers are.
 #
 #   1. A strategy that never quotes trades nothing and makes nothing.
-#   2. The finished strategies run clean, with and without latency, and are
-#      filled at least once: the report's profit figures must agree with each
-#      other (mm_sim checks that itself and says so in its RESULT line).
+#   2. The fixed and join strategies run clean, with and without latency,
+#      and are filled at least once: the report's profit figures must agree
+#      with each other (mm_sim checks that itself and says so in its RESULT
+#      line).
 #   3. The same run twice writes the same report, byte for byte.
 #   4. A symbol that is not in the file is an error, not an empty report.
 #
 #   scripts/mm_sim_smoke.sh <flow_gen> <mm_sim> [workdir] [mm_sim options...]
 #
 # With extra mm_sim options (for example "--strategy as") only that one run is
-# made, and its exit status is passed on.
+# made, and it is checked as the runs in 2 are.
 #
 # This checks that the simulator holds together. It says nothing about any
 # strategy: the market is generated, and the numbers mean nothing.
 #
-# Exit status: 0 all of that held, 1 something did not, 4 the strategy named
-# is not written yet.
+# Exit status: 0 all of that held, 1 something did not.
 set -uo pipefail
 
 FLOW_GEN="$1"
@@ -58,9 +58,6 @@ if [[ $# -gt 0 ]]; then
     run extra "$@"
     status=$?
     cat "$WORKDIR/mm_sim_smoke_extra.txt"
-    if [[ "$status" -eq 4 ]]; then
-        exit 4
-    fi
     [[ "$status" -eq 0 ]] || fail "mm_sim $* exited with status $status"
     grep -q "^RESULT: consistent" "$WORKDIR/mm_sim_smoke_extra.txt" || fail "no clean result"
     [[ "$(field "$WORKDIR/mm_sim_smoke_extra.json" fills)" != "0" ]] ||
@@ -77,7 +74,7 @@ run none --strategy none || fail "the 'none' strategy did not run clean"
 [[ "$(field "$WORKDIR/mm_sim_smoke_none.json" market_executed)" != "0" ]] ||
     fail "the generated market did not trade"
 
-# 2. The finished strategies.
+# 2. The fixed and join strategies.
 run fixed --strategy fixed --half-spread 1 || fail "the 'fixed' strategy did not run clean"
 run join --strategy join || fail "the 'join' strategy did not run clean"
 run late --strategy fixed --half-spread 2 --latency-us 50 --rebate 20 \

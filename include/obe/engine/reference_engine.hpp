@@ -27,8 +27,8 @@
 // It allocates a list node for every order that rests and a tree node for
 // every new price, and it chases a pointer for nearly everything it does. That
 // is accepted here. Its job is to be easy to read and hard to get wrong, so
-// that it can be the judge of the hand-written MatchingEngine, exactly as the
-// reference book judges the optimized containers in phase 4.
+// that it can be the judge of the pooled engine (MatchingEngine), exactly as
+// the reference book judges the optimized containers in phase 4.
 //
 // Sinks are held by reference and must outlive the engine. A sink must not
 // call back into the engine from inside a callback.

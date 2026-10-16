@@ -2,7 +2,7 @@
 //
 //   transport_bench [options]
 //     --io NAME          measure this transport only (default: every transport
-//                        that is written and can run here)
+//                        that can run here)
 //     --connections LIST connection counts to measure (default 1,8,64,256)
 //     --requests N       requests per row, over all connections (default 200000)
 //     --size N           bytes per request and per answer (default 32)
@@ -47,9 +47,8 @@
 // from exchange_server --io NAME and load_gen.
 //
 // Exit status: 0 ok, 1 usage or set-up error, 3 an answer was not the
-// request it answered (the timings are void), 4 the transport named with --io
-// is not written yet, 5 the transport named with --io cannot run on this
-// system.
+// request it answered (the timings are void), 5 the transport named with --io
+// cannot run on this system.
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -80,7 +79,6 @@
 #include "obe/util/cpu.hpp"
 #include "obe/util/format.hpp"
 #include "obe/util/huge_pages.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -318,17 +316,6 @@ Row measure(const Options& opt, std::uint32_t connections) {
     return row;
 }
 
-// Whether the transport's functions exist yet.
-template <class Net>
-bool written() {
-    try {
-        const Net probe{net::TransportConfig{}};
-        return true;
-    } catch (const util::Unimplemented&) {
-        return false;
-    }
-}
-
 bench::Summary summary(const std::vector<double>& runs) {
     return bench::summarize(runs, [](double v) { return v; });
 }
@@ -508,7 +495,6 @@ int run(int argc, char** argv) {
     }
 
     bool ok = true;
-    bool asked_for_unwritten = false;
     bool asked_for_unavailable = false;
     net::for_each_transport([&]<class Net>(std::type_identity<Net>) {
         if (!opt.io.empty() && opt.io != Net::kName) {
@@ -518,12 +504,6 @@ int run(int argc, char** argv) {
             asked_for_unavailable = !opt.io.empty();
             report.left_out.emplace_back("'" + std::string(Net::kName) +
                                          "' cannot run on this system and was left out");
-            return;
-        }
-        if (!written<Net>()) {
-            asked_for_unwritten = !opt.io.empty();
-            report.left_out.emplace_back("'" + std::string(Net::kName) +
-                                         "' is not written yet and was left out");
             return;
         }
         for (const std::uint32_t connections : opt.connections) {
@@ -539,12 +519,6 @@ int run(int argc, char** argv) {
     });
     report.huge_bytes = util::process_huge_bytes();
 
-    if (asked_for_unwritten) {
-        net::with_transport(opt.io, []<class Net>(std::type_identity<Net>) {
-            const Net probe{net::TransportConfig{}};  // throws, naming what is missing
-        });
-        return 4;
-    }
     if (asked_for_unavailable) {
         std::fprintf(stderr,
                      "error: the '%s' transport cannot run here: the kernel is too old for it, "
@@ -573,9 +547,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

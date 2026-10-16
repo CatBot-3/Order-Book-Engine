@@ -24,9 +24,8 @@
 // that asked for port 0 should wait for and read. It runs until it receives
 // SIGINT or SIGTERM, then tells subscribers the session has ended.
 //
-// Exit status: 0 stopped by a signal, 1 usage or set-up error, 4 the chosen
-// engine or transport is not written yet, 5 the chosen transport cannot run
-// on this system (--list-io says which can).
+// Exit status: 0 stopped by a signal, 1 usage or set-up error, 5 the chosen
+// transport cannot run on this system (--list-io says which can).
 
 #include <charconv>
 #include <chrono>
@@ -50,7 +49,6 @@
 #include "obe/net/transports.hpp"
 #include "obe/net/udp.hpp"
 #include "obe/util/format.hpp"
-#include "obe/util/todo.hpp"
 
 namespace {
 
@@ -284,9 +282,6 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         return run(argc, argv);
-    } catch (const obe::util::Unimplemented& e) {
-        std::fprintf(stderr, "not built yet: %s\n", e.what());
-        return 4;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
