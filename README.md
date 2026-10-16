@@ -11,31 +11,6 @@ simulator replays the feed and asks what would have happened to quotes placed
 in it. The engine can keep a journal of its requests and come back from being
 killed holding exactly what it held.
 
-The rule of the project: prove the book is right, measure before optimizing,
-and log every experiment with a before and an after, including the ones that
-did not help.
-
-## What is built
-
-| Part | State |
-|---|---|
-| Build, CI, lint, data fetch | done |
-| ITCH 5.0 parser, `itch_stats`, fuzzing | done; on the real day of 30 January 2019 its counts match the independent counter for all 368,366,634 messages |
-| Reference order book | done; the whole real day replays with every invariant counter at zero |
-| Measurement harness | done; baseline recorded on the real day (in a cloud VM, see Results) |
-| Optimization log | done: the pool, the flat order store, the vector price levels; thirteen entries from the first real-data run, accepted, rejected and inconclusive, every optimized book equal to the reference |
-| Matching engine and flow generator | done: reference engine, pooled engine (intrusive queues, orders from a pool, chunked id index), flow generator, round trip |
-| Lock-free queue and threaded pipeline | done: mutex queue, lock-free ring, seqlock, three-thread pipeline, benchmarks; one billion items through the ring in order, ThreadSanitizer silent |
-| TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; first latency curve taken (in a cloud VM: indicative) |
-| Market-making simulator | done: fill model, metrics, three strategies including Avellaneda-Stoikov, `mm_sim`; run on AAPL for the real day |
-| Journal, snapshot and crash recovery | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; first costs measured |
-| Self-match prevention and more order types | done in both engines: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot |
-| Compressed tick store | done: the file format, queries by time, recovery of an unfinished store, the compressing codec, `tick_store`, `tick_bench`; the real day stored at 7.30 bytes a tick against 34 raw, both stores verified against the book |
-| io_uring gateway against epoll | done: the gateway runs on either transport; the epoll transport, the io_uring rings (raw system calls) and the io_uring transport, `transport_bench`, `exchange_server --io`; system calls per request measured (io_uring 0.04 against epoll's 2.12 at 256 connections) |
-
-Every number in this README comes from a measured run, with the method in
-[`docs/benchmark-method.md`](docs/benchmark-method.md) and the machine it ran on
-stated beside it.
 
 ## Architecture
 
