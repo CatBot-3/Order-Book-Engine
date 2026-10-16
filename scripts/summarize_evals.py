@@ -114,6 +114,8 @@ def section_criteria(root, st, out):
     out.append("| Stage | Result |")
     out.append("|---|---|")
     for stage, (status, seconds) in st.items():
+        if stage == "summary":
+            continue  # written by this script; its row is from an earlier pass
         out.append(f"| {stage} | {'pass' if status == 0 else f'FAIL ({status})'}, {seconds} s |")
     out.append("")
 
@@ -228,6 +230,9 @@ def section_gateway(root, out):
     out.append("## Gateway: order-to-acknowledgement latency\n")
     curve = read_text(root / "gateway" / "latency_curve.md")
     out.append(curve.strip() if curve else "gateway stage did not run.")
+    pinning = read_text(root / "gateway" / "pinning.txt")
+    if pinning:
+        out.append("\nWhere each program ran:\n\n```\n" + pinning.strip() + "\n```")
     out.append("")
     out.append("## Transports: system calls per request\n")
     text = read_text(root / "transports" / "transports.txt")
@@ -297,7 +302,8 @@ def main():
     section_sim(root, out)
     section_ticks(root, out)
     print("\n".join(out))
-    failed = [s for s, (status, _) in st.items() if status != 0]
+    # The summary's own row is from an earlier pass of this script.
+    failed = [s for s, (status, _) in st.items() if status != 0 and s != "summary"]
     return 1 if failed else 0
 
 

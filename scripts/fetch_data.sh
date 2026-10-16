@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Download one Nasdaq TotalView-ITCH 5.0 sample file, verify its md5 and
-# optionally decompress it.
+# Download one Nasdaq TotalView-ITCH 5.0 sample file, verify it (md5 where the
+# server provides one, else size and gzip CRC) and optionally decompress it.
 #
 #   scripts/fetch_data.sh                    # default file, into ./data
 #   scripts/fetch_data.sh -f 12302019.NASDAQ_ITCH50.gz -x
@@ -10,7 +10,8 @@
 # redistributing any part of it.
 set -euo pipefail
 
-BASE_URL="https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH"
+# OBE_DATA_URL points the script at another server (a local one in a test).
+BASE_URL="${OBE_DATA_URL:-https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH}"
 FILE="01302019.NASDAQ_ITCH50.gz"
 DEST="data"
 EXTRACT=0
@@ -40,7 +41,7 @@ while getopts "f:d:xlh" opt; do
     esac
 done
 
-for tool in curl md5sum; do
+for tool in curl md5sum gzip; do
     command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
 done
 
@@ -57,28 +58,48 @@ echo "==> downloading $FILE (several GB; an interrupted download resumes)"
 curl -fL --retry 3 -C - -o "$gz" "$BASE_URL/$FILE"
 
 echo "==> downloading checksum"
-curl -fsSL --retry 3 -o "$sum" "$BASE_URL/$FILE.md5sum"
-
-# The checksum file's layout is not relied on: take the first 32-hex-digit token.
-expected="$(grep -oiE '[0-9a-f]{32}' "$sum" | head -n1 | tr 'A-F' 'a-f' || true)"
-if [[ -z "$expected" ]]; then
-    echo "error: no md5 found in $sum" >&2
-    exit 1
+# The server lists a .md5sum beside every file but answers 404 when asked for
+# one (it serves no file of an extension it does not know). Without it, the
+# check is the size the server states and the gzip stream's own CRC-32, which
+# covers every byte of the decompressed data.
+if curl -fsSL --retry 3 -o "$sum" "$BASE_URL/$FILE.md5sum" 2>/dev/null; then
+    # The checksum file's layout is not relied on: take the first 32-hex-digit token.
+    expected="$(grep -oiE '[0-9a-f]{32}' "$sum" | head -n1 | tr 'A-F' 'a-f' || true)"
+    if [[ -z "$expected" ]]; then
+        echo "error: no md5 found in $sum" >&2
+        exit 1
+    fi
+    echo "==> verifying md5"
+    actual="$(md5sum "$gz" | cut -d' ' -f1)"
+    if [[ "$expected" != "$actual" ]]; then
+        echo "error: md5 mismatch for $gz" >&2
+        echo "  expected $expected" >&2
+        echo "  actual   $actual" >&2
+        exit 1
+    fi
+    echo "    ok  $actual"
+else
+    rm -f "$sum"
+    echo "    the server did not serve $FILE.md5sum; checking the size and the gzip CRC instead"
+    expected_size="$(curl -fsSI "$BASE_URL/$FILE" | tr -d '\r' |
+        awk 'tolower($1) == "content-length:" { n = $2 } END { print n }')"
+    actual_size="$(wc -c <"$gz" | tr -d ' ')"
+    if [[ -z "$expected_size" || "$expected_size" != "$actual_size" ]]; then
+        echo "error: $gz is $actual_size bytes; the server says ${expected_size:-nothing}" >&2
+        exit 1
+    fi
+    echo "    size ok  $actual_size bytes"
+    if [[ "$EXTRACT" -eq 0 ]]; then
+        gzip -t "$gz" || { echo "error: $gz fails gzip's CRC check" >&2; exit 1; }
+        echo "    gzip CRC ok"
+    fi
 fi
-
-echo "==> verifying md5"
-actual="$(md5sum "$gz" | cut -d' ' -f1)"
-if [[ "$expected" != "$actual" ]]; then
-    echo "error: md5 mismatch for $gz" >&2
-    echo "  expected $expected" >&2
-    echo "  actual   $actual" >&2
-    exit 1
-fi
-echo "    ok  $actual"
 
 if [[ "$EXTRACT" -eq 1 ]]; then
     raw="${gz%.gz}"
     echo "==> decompressing to $raw"
+    # gzip checks the CRC-32 and the length in the stream's trailer as it
+    # finishes, and fails if either is wrong.
     gzip -dc "$gz" >"$raw.partial"
     mv "$raw.partial" "$raw"
     ls -l "$raw"

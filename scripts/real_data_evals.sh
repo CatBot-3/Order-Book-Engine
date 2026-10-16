@@ -275,7 +275,7 @@ stage_build() {
 }
 
 stage_data() {
-    local candidate=""
+    local candidate="" checked="not here (an uncompressed file was given or found)"
     if [[ -n "$DATA" ]]; then
         candidate="$DATA"
     elif [[ -f "$WORK/data/$DAY" ]]; then
@@ -288,10 +288,12 @@ stage_data() {
         gunzip -c "$REPO/data/$DAY.gz" >"$WORK/data/$DAY.part" && mv "$WORK/data/$DAY.part" "$WORK/data/$DAY" ||
             return 1
         candidate="$WORK/data/$DAY"
+        checked="gzip CRC while decompressing"
     else
-        say "downloading $DAY.gz from Nasdaq (about 4 GB)"
+        say "downloading $DAY.gz from Nasdaq (about 5 GB)"
         run "$REPO/scripts/fetch_data.sh" -f "$DAY.gz" -d "$WORK/data" -x || return 1
         candidate="$WORK/data/$DAY"
+        checked="by fetch_data.sh: md5 where Nasdaq serves one, else size and gzip CRC"
     fi
     if [[ ! -f "$candidate" ]]; then
         echo "error: $candidate is not a file" >&2
@@ -312,9 +314,7 @@ stage_data() {
     {
         echo "file             $F"
         echo "size (bytes)     $(stat -c %s "$F")"
-        if [[ -f "$(dirname "$F")/$DAY.gz.md5sum" ]]; then
-            echo "md5 checked      by fetch_data.sh"
-        fi
+        echo "integrity        $checked"
     } | tee "$1/data.txt"
 }
 
@@ -427,8 +427,11 @@ stage_pgo() {
     local build="$WORK/build/release-pgo"
     local reserve=()
     [[ "$RESERVE" -gt 0 ]] && reserve=(--reserve "$RESERVE")
+    # The training run is a replay_bench run too: it needs the same
+    # --no-copy when the file does not fit in memory.
+    # shellcheck disable=SC2046
     BUILD="$build" run "$REPO/scripts/pgo_build.sh" "$F" --impl flat-vector "${reserve[@]}" \
-        >"$1/build.txt" 2>&1 || { tail -n 20 "$1/build.txt"; return 1; }
+        $(copy_option) >"$1/build.txt" 2>&1 || { tail -n 20 "$1/build.txt"; return 1; }
     # shellcheck disable=SC2046
     run "$build/bench/replay_bench" "$F" --cpu "$CPU_A" --runs "$RUNS" --label pgo --impl flat-vector \
         "${reserve[@]}" $(copy_option) --json "$1/pgo.json" >"$1/pgo.txt" 2>&1
@@ -585,6 +588,10 @@ gateway_curve() {
     fi
     local port
     port="$(sed -n 's/^listening on [0-9.]*:\([0-9]*\).*/\1/p' "$server_log" | head -n 1)"
+    local pinned="not pinned (no taskset)"
+    command -v taskset >/dev/null && pinned="pinned with taskset"
+    echo "$label: exchange_server on CPU $CPU_A and md_listen on CPU $CPU_C, $pinned; load_gen on CPU $CPU_B" \
+        >>"$dir/pinning.txt"
     run "$B/apps/load_gen" --connect "127.0.0.1:$port" --connections 16 --cpu "$CPU_B" \
         --rate "$rates" --seconds "$seconds" --warmup 1 --symbols 16 --live 2000 \
         --json "$dir/$label.json" --label "$label" >"$dir/${label}_load_gen.txt" 2>&1

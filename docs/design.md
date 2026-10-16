@@ -230,17 +230,37 @@ be entered while a security is halted or in a quotation-only period, and they
 rest without matching until the auction that ends the halt. So crossed and
 locked updates should appear only outside state `T`.
 
-**Observed on the real file:** *not yet run.* After the first full-day replay,
-fill this in from `book_replay`'s output:
+**Observed on the real file** (`01302019.NASDAQ_ITCH50`, `book_replay`, 2026-10-16):
 
 | | state `T` | any other state |
 |---|---|---|
-| locked updates | | |
-| crossed updates | | |
+| locked updates | 0 | 16 |
+| crossed updates | 14 | 72 |
 
-If the `T` column is not zero, find out why before going further (which
-securities, what time of day, what message caused it) and write the answer
-here. `book_view <file> <symbol> --at <time>` shows the book at that moment.
+The other-state column is as expected: every one of those 88 updates is in a
+pause (state `P`: SXTC, PHUN, DLPN; for SXTC the reason is `LUDP`, a Limit
+Up-Limit Down pause, and the others' reasons were not looked up) or a
+quotation-only period (`Q`: EYEN), when orders rest without matching.
+
+The 14 in state `T` are all one security, SXTC, each within 264 µs of the
+end of one of its two pauses. SXTC was paused at 10:27:49
+and at 11:44:22 (reason `LUDP`), five minutes each. The feed ends a pause
+like this, read with a throwaway probe over the day:
+
+1. the cross trade: `Q`, cross type `H`, 11,813 shares at $5.82 at
+   10:32:49.516895423 (12,056 at $7.51 at 11:49:22.040446639);
+2. the trading action back to `T`, with the same timestamp;
+3. then the cross's executions, one `C` (executed with price) message per
+   resting order it filled, the first 135 µs and 149 µs after the resume.
+
+Between the second and the last of the third, the book still holds the
+orders that crossed during the pause, while its state already says `T`: a
+bid of $7.94 over an ask of $7.40, shrinking execution by execution. The
+last crossed update was 233 µs (first pause) and 264 µs (second) after the
+resume. So the book is right message by message, and "crossed while
+trading" here counts the interval between a resume and the executions it
+implies, not a fault. The counters stay as they are; the explanation is
+this paragraph.
 
 ## 5. Testing
 

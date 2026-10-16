@@ -27,9 +27,12 @@
 //   tests/store/compression_test.cpp  a target: no more than 10 bytes a tick,
 //                                     on average, over a generated market
 //
-// The design was made before any real day was profiled; `tick_store profile
-// <ITCH file>` prints what consecutive ticks differ by on real data, and the
-// log entry compares that table with what this codec bets on.
+// The design was made before any real day was profiled. `tick_store profile
+// <ITCH file>` prints what consecutive ticks differ by; on the day of 30
+// January 2019 it bore the bets out (35% of ticks repeat the security, 99.5%
+// of price changes are whole cents, 84% of size changes whole lots), and the
+// codec stored that day at 7.30 bytes a tick (docs/optimization-log.md,
+// entry 13).
 //
 // THE FORMAT OF ONE TICK
 //

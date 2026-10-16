@@ -19,18 +19,18 @@ did not help.
 | Phase | What | State |
 |---|---|---|
 | 0 | Build, CI, lint, data fetch | done |
-| 1 | ITCH 5.0 parser, `itch_stats`, fuzzing | done; not yet run on a real file |
-| 2 | Reference order book | done; not yet run on a real file |
-| 3 | Measurement harness | done; no baseline recorded yet |
-| 4 | Optimization log | harness, tests and tooling ready; the pool, the flat order store and the vector price levels done; no experiment on real data logged yet |
+| 1 | ITCH 5.0 parser, `itch_stats`, fuzzing | done; on the real day of 30 January 2019 its counts match the independent counter for all 368,366,634 messages |
+| 2 | Reference order book | done; the whole real day replays with every invariant counter at zero |
+| 3 | Measurement harness | done; baseline recorded on the real day (in a cloud VM, see Results) |
+| 4 | Optimization log | done: the pool, the flat order store, the vector price levels; thirteen entries from the real day, accepted, rejected and inconclusive, every optimized book equal to the reference |
 | 5 | Matching engine and flow generator | done: reference engine, pooled engine (intrusive queues, orders from a pool, chunked id index), flow generator, round trip |
-| 6 | Lock-free queue and threaded pipeline | done: mutex queue, lock-free ring, seqlock, three-thread pipeline, benchmarks; nothing measured yet |
-| 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; nothing measured yet |
-| 8 | Market-making simulator | done: fill model, metrics, three strategies including Avellaneda-Stoikov, `mm_sim`; not yet run on a real file |
-| 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; nothing measured yet |
+| 6 | Lock-free queue and threaded pipeline | done: mutex queue, lock-free ring, seqlock, three-thread pipeline, benchmarks; one billion items through the ring in order, ThreadSanitizer silent |
+| 7 | TCP gateway and market-data publisher | done: order gateway, MoldUDP64-style feed with a gap-detecting receiver, open-loop load generator; first latency curve taken (in a cloud VM: indicative) |
+| 8 | Market-making simulator | done: fill model, metrics, three strategies including Avellaneda-Stoikov, `mm_sim`; run on AAPL for the real day |
+| 9 | Journal, snapshot and crash recovery (stretch idea 1) | done: write-ahead journal, torn-tail detection, replay, snapshots, `engine_journal` and a kill test; first costs measured |
 | 10 | Self-match prevention and more order types (stretch idea 2) | done in both engines: post-only, iceberg orders and three self-match modes, through the gateway, the journal and the snapshot |
-| 11 | Compressed tick store (stretch idea 3) | done: the file format, queries by time, recovery of an unfinished store, the compressing codec (7.0 bytes a tick on a generated market, against 34 raw), `tick_store`, `tick_bench`; nothing recorded from a real file yet |
-| 12 | io_uring gateway against epoll (stretch idea 4) | done: the gateway runs on either transport; the epoll transport, the io_uring rings (raw system calls) and the io_uring transport, `transport_bench`, `exchange_server --io`; nothing measured yet |
+| 11 | Compressed tick store (stretch idea 3) | done: the file format, queries by time, recovery of an unfinished store, the compressing codec, `tick_store`, `tick_bench`; the real day stored at 7.30 bytes a tick against 34 raw, both stores verified against the book |
+| 12 | io_uring gateway against epoll (stretch idea 4) | done: the gateway runs on either transport; the epoll transport, the io_uring rings (raw system calls) and the io_uring transport, `transport_bench`, `exchange_server --io`; system calls per request measured (io_uring 0.04 against epoll's 2.12 at 256 connections) |
 
 No performance number appears in this README until it has been measured on
 real data with the method in [`docs/benchmark-method.md`](docs/benchmark-method.md).
@@ -118,14 +118,17 @@ day, several gigabytes compressed. It is never committed to this repository.
 
 ```sh
 scripts/fetch_data.sh -l                                  # list what the server has
-scripts/fetch_data.sh -f 01302019.NASDAQ_ITCH50.gz -x     # download, check md5, decompress
+scripts/fetch_data.sh -f 01302019.NASDAQ_ITCH50.gz -x     # download, check, decompress
 ```
 
 Read Nasdaq's terms before redistributing any part of it. CI and the tests use
 synthetic fixtures made by the project's own generator.
 
-File used for the numbers below: *to be recorded from the first run* (name,
-uncompressed size, message count).
+File used for the numbers below: `01302019.NASDAQ_ITCH50` (30 January 2019),
+11,245,883,092 bytes uncompressed, 368,366,634 messages, 8,714 symbols. The
+`.gz` is 4,764,426,091 bytes with md5 `54b7afd0be7f925f7e9d67a23898827b`
+(Nasdaq lists a `.md5sum` for it but serves none, so `fetch_data.sh` checks
+the size and gzip's CRC instead).
 
 ## Reproducing the checks
 
@@ -358,16 +361,38 @@ code. The full contract is in
 
 Filled from real runs only. Method, hardware and flags go with every row.
 
+The first real-data run (2026-10-16) is from the cloud machine of a Claude
+session: 2 shared virtual CPUs (Intel Xeon, 2.10GHz as reported), 7.8 GiB,
+Linux 6.18.44, GCC 13.3.0 `-O3 -DNDEBUG`, pinned to one CPU, five runs after
+one warm-up. The day is larger than that memory, so every replay read it
+through the page cache (`--no-copy`), and the max column is mostly page
+faults and the growth of tables that were not pre-sized. Treat the ratios between rows as the result and the absolute numbers
+as this machine's; the same run on a desktop gets its own columns.
+
+All books replay the whole day, 368,366,634 messages; latencies in ns per
+message, medians over the runs.
+
 | Build | Messages/s | p50 | p99 | p99.9 | max | Cache misses per message |
 |---|---|---|---|---|---|---|
-| Reference (`std::map`, `std::unordered_map`) | | | | | | |
-| + flat order table | | | | | | |
-| + contiguous price levels | | | | | | |
-| + pool allocator | | | | | | |
-| Final | | | | | | |
+| Reference (`std::map`, `std::unordered_map`) | 2,361,505 | 426 | 1,645 | 14,141 | 177.5 ms | n/a |
+| + flat order table | 2,668,257 | 342 | 1,493 | 14,141 | 92.7 ms | n/a |
+| + contiguous price levels | 4,712,324 | 232 | 746 | 5,485 | 81.4 ms | n/a |
+| + table pre-sized for the day's peak | 4,780,096 | 224 | 731 | 5,363 | 38.5 ms | n/a |
+| + prefetch of the next message's order: final | 6,104,579 | 163 | 609 | 2,560 | 28.6 ms | n/a |
+| Contiguous price levels alone | 3,399,704 | 281 | 1,127 | 10,727 | 164.9 ms | n/a |
+| Reference containers with a pool allocator | 2,473,392 | 426 | 1,615 | 14,141 | 199.9 ms | n/a |
+| Pre-sized combined book, link-time optimized | 4,912,284 | 228 | 731 | 5,120 | 40.2 ms | n/a |
+| Pre-sized combined book, profile-guided (trained on this day) | 5,494,735 | 224 | 731 | 5,607 | 87.0 ms | n/a |
+
+Final against reference: 2.59x the throughput, the median message 2.6 times
+cheaper, p99.9 5.5 times lower. Every optimized row published exactly the
+reference's best-bid-and-offer stream (hash `73b11ec0681d1994`), and
+`scripts/diff_books.sh` matched all 8,695 securities. No cache-miss column:
+this machine exposes no hardware counters.
 
 Every experiment, accepted or rejected, is in
-[`docs/optimization-log.md`](docs/optimization-log.md).
+[`docs/optimization-log.md`](docs/optimization-log.md), with the feed profile
+the hypotheses rest on.
 
 ### Order-to-acknowledgement latency
 
@@ -377,12 +402,55 @@ the kernel's TCP stack, the gateway, the engine), not a network. Latency is
 counted from each request's scheduled send time, so a stalled server cannot
 hide its own delay.
 
+`exchange_server --io epoll --engine pooled`, 16 connections, 10 s measured per
+rate after a 1 s warm-up, from the same cloud run. The exchange, the
+subscriber and the load generator shared two CPUs, and the generator itself
+fell up to 7 ms behind its schedule: the tails describe that machine more than
+the gateway. A machine with free cores to pin each program to gives the curve
+worth quoting.
+
 | Requests/s | p50 µs | p99 µs | p99.9 µs | max µs | Generator lag max µs |
 |---|---|---|---|---|---|
-| | | | | | |
+| 1,000 | 69.6 | 1,441.8 | 3,735.6 | 5,631.6 | 4,298.7 |
+| 5,000 | 24.6 | 819.2 | 3,342.3 | 5,731.1 | 3,119.2 |
+| 20,000 | 24.6 | 1,146.9 | 25,165.8 | 34,738.7 | 3,148.2 |
+| 50,000 | 19.5 | 1,671.2 | 5,111.8 | 9,193.8 | 7,052.5 |
+| 100,000 | 20.0 | 2,064.4 | 5,111.8 | 8,807.4 | 5,343.7 |
 
-Filled by `scripts/latency_curve.py` from a real run, with the machine, the
-number of connections and the CPUs each program was pinned to.
+The same curve for the reference engine and for io_uring, and
+`transport_bench`'s system calls per request (epoll 3.00 falling to 2.12,
+io_uring 2.00 falling to 0.04, from 1 to 256 busy connections), are in entry
+12 of the optimization log.
+
+Filled by `scripts/latency_curve.py` from a real run. In this one the
+exchange and the subscriber ran on CPU 1 and the load generator on CPU 0;
+`real_data_evals.sh` now writes that into `gateway/pinning.txt` with the
+results.
+
+### The rest of the day's run
+
+The same cloud run, the same day (`scripts/real_data_evals.sh`; the log has
+the details).
+
+| What | Result |
+|---|---|
+| Matching engines (`engine_bench`, 2,000,000 synthetic requests) | pooled 12,581,950 requests/s against the reference's 6,062,610 (2.08x), output identical |
+| Lock-free ring (`queue_bench`, two CPUs) | 74,891,081 items/s against 4,412,509 for the mutex queue; the billion-item run in order |
+| Tick store, whole day, 4,096 ticks a block | 174,890,436 ticks: 7.30 bytes a tick against 34.02 raw, 8.78 through `zstd -3` and 6.88 through `zstd -19` (27 minutes); both stores verified against the book |
+| Journal (`journal_bench` on this VM's disk) | 4,699,037 requests/s without, 3,670,706 with one write per 4,096 requests; one `fdatasync` 143 µs alone, 880 µs after 4,096 records; the crash test passes |
+
+`mm_sim` on AAPL, 09:30 to 16:00, 50 µs latency, 100 shares a quote: a
+simulation under stated assumptions, not an estimate of profit.
+
+| Strategy | Fills | Profit | Earned at the fills | Markout 10 s (cents a share) |
+|---|---|---|---|---|
+| Fixed spread | 11,168 | -$4,902.99 | +$7,699.49 | -0.614 |
+| Join the best | 15,038 | -$5,168.47 | +$7,580.56 | -0.630 |
+| Avellaneda-Stoikov | 11,281 | -$4,639.70 | +$6,168.29 | -0.564 |
+
+Every strategy earned at the moment of its fills and lost more afterwards:
+the price kept moving the way that had filled it (adverse selection, design
+point 6 of `avellaneda_stoikov.hpp`). The inventory-aware quotes lost least.
 
 ## Testing
 
@@ -406,8 +474,9 @@ number of connections and the CPUs each program was pinned to.
 
 1. One venue. This is Nasdaq's own book, not a consolidated view across
    exchanges.
-2. Personal hardware. Numbers are from one desktop machine and are labelled
-   with it. They are not a claim about production trading systems.
+2. One machine at a time. So far the numbers are from the cloud machine of a
+   Claude session (two shared virtual CPUs), labelled with it; a desktop run
+   gets its own. They are not a claim about production trading systems.
 3. No real exchange. Market data comes from a file or from this project's own
    exchange. There is no live feed, no connection to a broker, and a gap in the
    UDP feed is detected but not recovered.
@@ -432,8 +501,8 @@ number of connections and the CPUs each program was pinned to.
    rotation and no second copy.
 10. The tick store keeps the best bid and offer and nothing else: no depth,
     no trades. It is one stream in time order, so a query for one security
-    reads every block in its range of time. No size or speed is quoted for
-    it: nothing has been recorded from a real day.
+    reads every block in its range of time. Its sizes and speeds so far are
+    from one day and one machine.
 11. Linux only, GCC and Clang only. The io_uring transport needs Linux 5.11
     and a system that allows io_uring; where it is refused, the gateway runs
     on epoll, the io_uring tests skip themselves, and `--io uring` exits with
